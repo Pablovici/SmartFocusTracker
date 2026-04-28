@@ -1,0 +1,20 @@
+# Clé secrète GCP
+gcp_service_account.json
+
+# Variables d'environnement locales
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
