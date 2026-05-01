@@ -41,6 +41,7 @@ TVOC_HIGH        = 150  # Above this ppb → poor air quality alert
 WEATHER_ANNOUNCE_INTERVAL = 3600  # Minimum seconds between weather announcements (1 hour)
 BREAK_REMINDER_INTERVAL   = 3600  # Remind break after 1 hour of continuous work
 BREAK_FOLLOWUP_DELAY      = 900   # Re-alert if no break taken after 15 minutes
+ALERT_COOLDOWN            = 3600  # Cooldown for humidity and air quality alerts (1 hour)
 
 # ============================================================
 # I2C — Hardware pin configuration
