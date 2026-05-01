@@ -1,126 +1,229 @@
-# bigquery_client.py
-# Abstraction layer for all BigQuery interactions.
-# All database reads and writes go through this module —
-# no other file in the middleware imports the BigQuery client directly.
+# middleware/bigquery_client.py
+# Handles all BigQuery read and write operations.
+# All other middleware files import from here — never directly from google.cloud.bigquery.
+# Assigned to: Pablo
 
 import os
-from google.cloud import bigquery
+import uuid
 from datetime import datetime, timezone
+from google.cloud import bigquery
 
-# The client is instantiated once at module level.
-# It automatically uses the service account defined by the
-# GOOGLE_APPLICATION_CREDENTIALS environment variable.
-client = bigquery.Client()
+# ============================================================
+# CLIENT INITIALIZATION
+# ============================================================
 
-# Table references are built from environment variables so the app
-# can be redeployed against a different GCP project without code changes.
-PROJECT    = os.environ["GCP_PROJECT_ID"]
-DATASET    = os.environ["GCP_DATASET_ID"]
-T_SENSORS  = os.environ["BQ_TABLE_SENSORS"]
-T_SESSIONS = os.environ["BQ_TABLE_SESSIONS"]
-T_WEATHER  = os.environ["BQ_TABLE_WEATHER"]
+# BigQuery client is initialized once at module load.
+# Credentials are loaded automatically from the path defined
+# in GOOGLE_APPLICATION_CREDENTIALS environment variable.
+client = bigquery.Client(project=os.environ["GCP_PROJECT_ID"])
 
-def full_table(name):
-    # Returns the fully qualified BigQuery table ID: project.dataset.table
-    return "{}.{}.{}".format(PROJECT, DATASET, name)
+# Dataset and table references built from environment variables.
+# Never hardcoded — changing .env is enough to retarget a different dataset.
+DATASET = os.environ["GCP_DATASET_ID"]
 
+TABLE_INDOOR   = "{}.{}".format(DATASET, os.environ["BQ_TABLE_INDOOR"])
+TABLE_OUTDOOR  = "{}.{}".format(DATASET, os.environ["BQ_TABLE_OUTDOOR"])
+TABLE_SESSIONS = "{}.{}".format(DATASET, os.environ["BQ_TABLE_SESSIONS"])
+TABLE_ALERTS   = "{}.{}".format(DATASET, os.environ["BQ_TABLE_ALERTS"])
 
-# ----------------------------------------------------------
-# SENSOR READINGS
-# ----------------------------------------------------------
+# ============================================================
+# HELPERS
+# ============================================================
 
-def insert_sensor_reading(data):
-    # Inserts one row into sensor_readings.
-    # data is the dict received directly from the M5Stack payload.
-    # timestamp is generated server-side to ensure consistency.
+def now_utc():
+    # Returns current UTC time as a BigQuery-compatible string.
+    return datetime.now(timezone.utc).isoformat()
+
+def run_query(sql):
+    # Executes a parameterless SQL query and returns results as a list of dicts.
+    # Used for all SELECT operations throughout the middleware.
+    query_job = client.query(sql)
+    return [dict(row) for row in query_job.result()]
+
+# ============================================================
+# INDOOR READINGS
+# ============================================================
+
+def insert_indoor(data):
+    # Inserts one row of indoor sensor data into BigQuery.
+    # Called by Flask route POST /data/indoor.
     row = {
-        "timestamp":       datetime.now(timezone.utc).isoformat(),
-        "temperature_in":  data.get("temperature"),
-        "humidity":        data.get("humidity"),
-        "co2_ppm":         data.get("co2_ppm"),
-        "tvoc_ppb":        data.get("tvoc_ppb"),
-        "motion_detected": data.get("motion"),
-        "focus_status":    data.get("focus_status", "focus")
+        "timestamp":         now_utc(),
+        "temperature":       data.get("temperature"),
+        "humidity":          data.get("humidity"),
+        "co2_ppm":           data.get("co2_ppm"),
+        "tvoc_ppb":          data.get("tvoc_ppb"),
+        "air_quality_label": data.get("air_quality_label"),
+        "motion_detected":   data.get("motion_detected"),
     }
-    errors = client.insert_rows_json(full_table(T_SENSORS), [row])
+    errors = client.insert_rows_json(TABLE_INDOOR, [row])
     if errors:
-        print("[BQ] Insert error:", errors)
-        return False
-    return True
+        print("[BQ] insert_indoor errors:", errors)
+    return len(errors) == 0
 
-def fetch_latest_sensor():
-    # Returns the most recent row from sensor_readings.
-    # Used by the device at boot to restore the last known state.
-    query = """
+def get_latest_indoor():
+    # Returns the most recent indoor sensor reading.
+    # Used by GET /latest for boot sync on both M5Stacks.
+    sql = """
         SELECT *
-        FROM `{table}`
+        FROM `{}`
         ORDER BY timestamp DESC
         LIMIT 1
-    """.format(table=full_table(T_SENSORS))
+    """.format(TABLE_INDOOR)
+    rows = run_query(sql)
+    return rows[0] if rows else {}
 
-    results = client.query(query).result()
-    for row in results:
-        return dict(row)
-    return None
-
-
-# ----------------------------------------------------------
-# FOCUS SESSIONS
-# ----------------------------------------------------------
-
-def insert_focus_session(session):
-    # Inserts a completed focus session into focus_sessions.
-    # session_end and duration_min may be None if the session
-    # was interrupted (e.g. device reboot mid-session).
-    row = {
-        "session_id":    session.get("session_id"),
-        "session_start": session.get("session_start"),
-        "session_end":   session.get("session_end"),
-        "duration_min":  session.get("duration_min"),
-        "pauses_count":  session.get("pauses_count"),
-        "avg_co2_ppm":   session.get("avg_co2_ppm"),
-        "avg_humidity":  session.get("avg_humidity")
-    }
-    errors = client.insert_rows_json(full_table(T_SESSIONS), [row])
-    if errors:
-        print("[BQ] Session insert error:", errors)
-        return False
-    return True
-
-def fetch_sensor_history(hours=24):
-    # Returns all sensor readings from the last N hours.
-    # Used by the Streamlit dashboard to plot historical data.
-    query = """
-        SELECT *
-        FROM `{table}`
-        WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR)
+def get_indoor_history(days=7):
+    # Returns indoor readings for the last N days.
+    # Used by Streamlit dashboard for historical charts.
+    sql = """
+        SELECT timestamp, temperature, humidity,
+               co2_ppm, tvoc_ppb, air_quality_label
+        FROM `{}`
+        WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {} DAY)
         ORDER BY timestamp ASC
-    """.format(table=full_table(T_SENSORS), hours=hours)
+    """.format(TABLE_INDOOR, days)
+    return run_query(sql)
 
-    results = client.query(query).result()
-    return [dict(row) for row in results]
+# ============================================================
+# OUTDOOR WEATHER
+# ============================================================
 
-
-# ----------------------------------------------------------
-# WEATHER HISTORY
-# ----------------------------------------------------------
-
-def insert_weather(data):
-    # Inserts one weather snapshot into weather_history.
-    # forecast_json stores the 7-day forecast as a serialized
-    # JSON string to avoid a complex nested schema in BigQuery.
-    import json
+def insert_outdoor(data):
+    # Inserts one outdoor weather snapshot into BigQuery.
+    # Called whenever Flask fetches fresh data from OpenWeatherMap.
     row = {
-        "timestamp":     datetime.now(timezone.utc).isoformat(),
-        "temp_out":      data.get("temp_out"),
-        "humidity_out":  data.get("humidity_out"),
-        "description":   data.get("description"),
-        "icon_code":     data.get("icon_code"),
-        "wind_speed":    data.get("wind_speed"),
-        "forecast_json": json.dumps(data.get("forecast", []))
+        "timestamp": now_utc(),
+        "city":      data.get("city"),
+        "temperature": data.get("temperature"),
+        "humidity":  data.get("humidity"),
+        "condition": data.get("condition"),
+        "wind_speed": data.get("wind_speed"),
+        "icon_code": data.get("icon_code"),
     }
-    errors = client.insert_rows_json(full_table(T_WEATHER), [row])
+    errors = client.insert_rows_json(TABLE_OUTDOOR, [row])
     if errors:
-        print("[BQ] Weather insert error:", errors)
-        return False
-    return True
+        print("[BQ] insert_outdoor errors:", errors)
+    return len(errors) == 0
+
+def get_outdoor_history(days=7):
+    # Returns outdoor weather history for the last N days.
+    # Used by Streamlit dashboard.
+    sql = """
+        SELECT timestamp, temperature, humidity, condition, wind_speed
+        FROM `{}`
+        WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {} DAY)
+        ORDER BY timestamp ASC
+    """.format(TABLE_OUTDOOR, days)
+    return run_query(sql)
+
+# ============================================================
+# WORK SESSIONS
+# ============================================================
+
+def start_session(card_id):
+    # Creates a new work session row in BigQuery.
+    # Returns the generated session_id for future updates.
+    session_id = str(uuid.uuid4())
+    row = {
+        "session_id":         session_id,
+        "rfid_card_id":       card_id,
+        "start_time":         now_utc(),
+        "end_time":           None,
+        "total_work_minutes": None,
+        "pauses":             "[]",  # JSON string — empty list initially
+    }
+    errors = client.insert_rows_json(TABLE_SESSIONS, [row])
+    if errors:
+        print("[BQ] start_session errors:", errors)
+        return None
+    return session_id
+
+def end_session(session_id, total_work_minutes, pauses):
+    # Updates an existing session row with end time and work duration.
+    # BigQuery does not support UPDATE directly on streaming inserts —
+    # we use DML UPDATE via a query job instead.
+    sql = """
+        UPDATE `{}`
+        SET end_time = '{}',
+            total_work_minutes = {},
+            pauses = '{}'
+        WHERE session_id = '{}'
+    """.format(
+        TABLE_SESSIONS,
+        now_utc(),
+        total_work_minutes,
+        pauses,
+        session_id
+    )
+    client.query(sql).result()
+
+def get_current_session():
+    # Returns the most recent session that has not ended yet.
+    # Used by GET /session/current for both M5Stacks.
+    sql = """
+        SELECT session_id, rfid_card_id, start_time, pauses
+        FROM `{}`
+        WHERE end_time IS NULL
+        ORDER BY start_time DESC
+        LIMIT 1
+    """.format(TABLE_SESSIONS)
+    rows = run_query(sql)
+    return rows[0] if rows else None
+
+def get_session_history(limit=20):
+    # Returns the last N completed sessions.
+    # Used by Streamlit dashboard for session analytics.
+    sql = """
+        SELECT session_id, start_time, end_time,
+               total_work_minutes, pauses
+        FROM `{}`
+        WHERE end_time IS NOT NULL
+        ORDER BY start_time DESC
+        LIMIT {}
+    """.format(TABLE_SESSIONS, limit)
+    return run_query(sql)
+
+def get_session_stats():
+    # Returns aggregate session statistics for the Streamlit dashboard.
+    # Includes average work time, total sessions, and total work minutes.
+    sql = """
+        SELECT
+            COUNT(*)                        AS total_sessions,
+            AVG(total_work_minutes)         AS avg_work_minutes,
+            SUM(total_work_minutes)         AS total_work_minutes,
+            MAX(total_work_minutes)         AS longest_session_minutes
+        FROM `{}`
+        WHERE end_time IS NOT NULL
+    """.format(TABLE_SESSIONS)
+    rows = run_query(sql)
+    return rows[0] if rows else {}
+
+# ============================================================
+# ALERTS
+# ============================================================
+
+def insert_alert(alert_type, message):
+    # Logs an alert event to BigQuery.
+    # Called by Flask whenever an alert is triggered.
+    row = {
+        "timestamp":    now_utc(),
+        "alert_type":   alert_type,
+        "message":      message,
+        "acknowledged": False,
+    }
+    errors = client.insert_rows_json(TABLE_ALERTS, [row])
+    if errors:
+        print("[BQ] insert_alert errors:", errors)
+    return len(errors) == 0
+
+def get_recent_alerts(limit=10):
+    # Returns the most recent alerts.
+    # Used by Streamlit dashboard.
+    sql = """
+        SELECT timestamp, alert_type, message
+        FROM `{}`
+        ORDER BY timestamp DESC
+        LIMIT {}
+    """.format(TABLE_ALERTS, limit)
+    return run_query(sql)
