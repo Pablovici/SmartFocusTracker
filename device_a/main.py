@@ -15,7 +15,7 @@ from sensor_reader import SensorReader
 from display_manager import DisplayManager
 from focus_tracker import FocusTracker
 from sync_manager import fetch_latest
-from config import (
+from device_a.config import (
     SENSOR_INTERVAL,
     MIDDLEWARE_URL,
     UTC_OFFSET_HOURS,

@@ -5,7 +5,7 @@
 
 import urequests
 import ujson
-from config import MIDDLEWARE_URL
+from device_a.config import MIDDLEWARE_URL
 
 def fetch_latest():
     # Calls GET /latest on the middleware, which queries BigQuery
