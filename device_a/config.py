@@ -1,48 +1,57 @@
-# config.py
-# Central configuration file for the M5Stack device.
-# All environment-specific values are defined here so that
-# redeploying the app on a different network or against a
-# different backend only requires changes in this single file.
+# device_a/config.py
+# Central configuration file for M5Stack A (main device).
+# All environment-specific values are defined here.
+# To redeploy on a different network or backend,
+# only this file needs to be modified.
 
-# --- Middleware ---
-# Base URL of the Flask API running on Cloud Run.
-# All device HTTP calls are routed through this endpoint.
-MIDDLEWARE_URL = "https://your-cloud-run-url"
+# ============================================================
+# WIFI — Known networks, tried in order on boot
+# ============================================================
+KNOWN_NETWORKS = [
+    ("iPhone de Amir", "toad1234"),   # Home network
+    ("iot-unil", ""),                  # TODO: add iot-unil password when available
+]
 
-# --- WiFi ---
-# Default credentials loaded at boot. The user can override
-# these at runtime via the WiFi settings screen in the UI.
-WIFI_SSID     = "your_wifi_name"
-WIFI_PASSWORD = "your_wifi_password"
+# ============================================================
+# MIDDLEWARE — Flask API endpoint
+# ============================================================
+MIDDLEWARE_URL = "http://localhost:8080"  # TODO: replace with Cloud Run URL after deployment
 
-# --- Sensor read interval ---
-# How often (in seconds) the device reads sensors and posts
-# data to the middleware. 60s is a reasonable balance between
-# data granularity and battery/bandwidth usage.
-SENSOR_INTERVAL = 60
+# ============================================================
+# NTP — Time synchronization
+# ============================================================
+NTP_UTC_OFFSET = 2      # UTC+2 for Switzerland (summer time)
+                         # TODO: change to 1 in winter (UTC+1)
 
-# --- Weather fetch interval ---
-# OpenWeatherMap free tier allows 60 calls/minute.
-# Fetching every 10 minutes is well within the limit.
-WEATHER_INTERVAL = 600  # 10 minutes in seconds
+# ============================================================
+# SENSORS — Reading intervals in seconds
+# ============================================================
+SENSOR_INTERVAL = 60    # How often sensors are read and posted to middleware
 
-# --- Focus logic ---
-# Time without a break (in minutes) before the device
-# triggers a vocal alert recommending a pause.
-FOCUS_ALERT_THRESHOLD_MIN = 45
+# ============================================================
+# ALERT THRESHOLDS — Values that trigger TTS announcements
+# ============================================================
+HUMIDITY_MIN     = 40   # Below this % → dry air alert
+CO2_HIGH         = 1000 # Above this ppm → poor air quality alert
+TVOC_HIGH        = 150  # Above this ppb → poor air quality alert
 
-# Minimum time (in seconds) between two PIR-triggered
-# announcements. Prevents the device from being annoying.
-PIR_ANNOUNCEMENT_COOLDOWN = 3600  # 1 hour in seconds
+# ============================================================
+# ALERT TIMING — Cooldowns to avoid spamming announcements
+# ============================================================
+WEATHER_ANNOUNCE_INTERVAL = 3600  # Minimum seconds between weather announcements (1 hour)
+BREAK_REMINDER_INTERVAL   = 3600  # Remind break after 1 hour of continuous work
+BREAK_FOLLOWUP_DELAY      = 900   # Re-alert if no break taken after 15 minutes
 
-# --- Alert thresholds ---
-# Values beyond these limits trigger local UI alerts
-# and vocal warnings via TTS, as required by the project spec.
-HUMIDITY_ALERT_MIN =  40    # % — below this, air is too dry
-CO2_ALERT_MAX      = 1500   # ppm — above this, air quality is poor
-TVOC_ALERT_MAX     = 500    # ppb — above this, VOC level is concerning
+# ============================================================
+# I2C — Hardware pin configuration
+# ============================================================
+# Port A (hardware I2C) — ENVIII sensor
+I2C_PORT_A_SCL = 22
+I2C_PORT_A_SDA = 21
 
-# --- Display ---
-# Target timezone offset from UTC, used to display local time
-# after NTP sync. UTC+2 corresponds to Swiss summer time (CEST).
-UTC_OFFSET_HOURS = 2
+# Port C (software I2C) — TVOC/eCO2 sensor
+I2C_PORT_C_SCL = 13
+I2C_PORT_C_SDA = 14
+
+# Port B (GPIO) — PIR motion sensor
+PIR_PIN = 26
