@@ -23,7 +23,7 @@ KNOWN_NETWORKS = _load_networks()
 # ============================================================
 # MIDDLEWARE — Flask API endpoint
 # ============================================================
-MIDDLEWARE_URL = "http://localhost:8080"  # TODO: replace with Cloud Run URL after deployment
+MIDDLEWARE_URL = "https://smartfocustracker-middleware-1054003632036.europe-west6.run.app"
 
 # ============================================================
 # NTP — Time synchronization
