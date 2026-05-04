@@ -1,14 +1,24 @@
 # device_b/config.py
-# Configuration for M5Stack B (satellite device).
-# Handles RFID badge reading and posts session events to middleware.
+# Central configuration for M5Stack B (satellite device).
+# To redeploy on a different setup, only this file needs to be modified.
+# WiFi credentials are loaded from wifi_networks.json (not committed to Git).
+
+import ujson
 
 # ============================================================
-# WIFI — Same logic as device_a, tried in order on boot
+# WIFI — Loaded from external file for security
 # ============================================================
-KNOWN_NETWORKS = [
-    ("iPhone de Amir", "toad1234"),  # Home network
-    ("iot-unil", ""),                 # TODO: add iot-unil password when available
-]
+
+def _load_networks():
+    # Reads WiFi credentials from a local JSON file excluded from Git.
+    # Falls back to iot-unil if file is not found.
+    try:
+        with open("wifi_networks.json") as f:
+            return ujson.load(f)
+    except:
+        return [("iot-unil", "")]  # TODO: add iot-unil password when available
+
+KNOWN_NETWORKS = _load_networks()
 
 # ============================================================
 # MIDDLEWARE — Flask API endpoint
@@ -18,11 +28,10 @@ MIDDLEWARE_URL = "http://localhost:8080"  # TODO: replace with Cloud Run URL aft
 # ============================================================
 # SENSORS — Reading interval in seconds
 # ============================================================
-SENSOR_INTERVAL = 60  # How often TVOC is read and posted
+SENSOR_INTERVAL = 60  # How often TVOC is read and posted to middleware
 
 # ============================================================
 # I2C — Hardware pin configuration
 # ============================================================
-# Port A (hardware I2C) — RFID reader
-I2C_PORT_A_SCL = 22
-I2C_PORT_A_SDA = 21
+I2C_PORT_A_SCL = 22  # Port A SCL — RFID reader
+I2C_PORT_A_SDA = 21  # Port A SDA — RFID reader
