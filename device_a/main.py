@@ -13,7 +13,7 @@ import ujson
 from machine import I2C, SoftI2C, Pin
 from m5stack import lcd, btnA, btnB, btnC
 
-# TODO: confirm exact UIFlow import names for ENVIII and TVOC on physical device
+# TODO: confirm exact UIFlow import names on physical device
 from env3 import ENVUnit
 from tvoc import TVOCUnit
 
@@ -23,35 +23,42 @@ from config import (
     HUMIDITY_MIN, CO2_HIGH,
     WEATHER_ANNOUNCE_INTERVAL, ALERT_COOLDOWN,
     BREAK_REMINDER_INTERVAL, BREAK_FOLLOWUP_DELAY,
+    DRAW_INTERVAL,
     I2C_PORT_A_SCL, I2C_PORT_A_SDA,
     I2C_PORT_C_SCL, I2C_PORT_C_SDA,
     PIR_PIN
 )
 
 # ============================================================
-# DISPLAY CONSTANTS — all colors defined once here
+# DISPLAY CONSTANTS
 # ============================================================
-COLOR_BG       = 0x1a1a2e  # Dark blue background
-COLOR_WHITE    = 0xFFFFFF
-COLOR_GREY     = 0xAAAAAA
-COLOR_DIVIDER  = 0x444444
-COLOR_GOOD     = 0x00FF00
-COLOR_WARN     = 0xFFAA00
-COLOR_BAD      = 0xFF0000
+COLOR_BG      = 0x1a1a2e
+COLOR_WHITE   = 0xFFFFFF
+COLOR_GREY    = 0xAAAAAA
+COLOR_DIVIDER = 0x444444
+COLOR_GOOD    = 0x00FF00
+COLOR_WARN    = 0xFFAA00
+COLOR_BAD     = 0xFF0000
 
 # ============================================================
 # HARDWARE INITIALIZATION
 # ============================================================
+
+# Port A — hardware I2C for ENVIII
 i2c_a = I2C(1, scl=Pin(I2C_PORT_A_SCL), sda=Pin(I2C_PORT_A_SDA), freq=100000)
 env   = ENVUnit(i2c=i2c_a)
 
+# Port C — software I2C for TVOC
 i2c_c = SoftI2C(scl=Pin(I2C_PORT_C_SCL), sda=Pin(I2C_PORT_C_SDA), freq=100000)
 tvoc  = TVOCUnit(i2c=i2c_c)
 
+# Port B — GPIO for PIR
 pir = Pin(PIR_PIN, Pin.IN)
 
 # ============================================================
 # GLOBAL STATE
+# Single source of truth for all displayed and posted data.
+# Safe defaults ensure the UI never crashes on missing values.
 # ============================================================
 state = {
     "temperature":       None,
@@ -66,12 +73,11 @@ state = {
         "icon":      "01d",
         "forecast":  []
     },
-    "session_active":  False,
-    "session_paused":  False,
-    "session_start":   None,
-    "session_work_sec": 0,   # Accumulated work seconds, pauses excluded
-    "time_str":        "--:--",
-    "date_str":        "---",
+    "session_active":   False,
+    "session_paused":   False,
+    "session_work_sec": 0,
+    "time_str":         "--:--",
+    "date_str":         "---",
 }
 
 # Tracks last announcement time per alert type
@@ -82,7 +88,7 @@ alert_times = {
     "break":       0,
 }
 
-# 0: main screen, 1: session screen, 2: wifi screen
+# 0: main screen  1: session screen  2: wifi screen
 current_screen = 0
 
 # ============================================================
@@ -91,44 +97,41 @@ current_screen = 0
 
 def connect_wifi():
     # Tries each known network in order until one connects.
-    # Falls back to manual entry screen if all fail.
-    # Returns True if connected, False otherwise.
+    # Falls back to manual WiFi screen if all networks fail.
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
 
     for ssid, password in KNOWN_NETWORKS:
         display_message("Connecting to\n{}".format(ssid))
         wlan.connect(ssid, password)
-
         for _ in range(10):
             if wlan.isconnected():
                 display_message("Connected!")
                 return True
             time.sleep(1)
 
-    display_message("No WiFi.\nCheck credentials.")
+    display_message("No WiFi found.\nCheck credentials.")
     show_wifi_screen()
     return wlan.isconnected()
 
 def show_wifi_screen():
-    # Shows available networks and lets user select via buttons.
+    # Displays available network options via physical buttons.
     # TODO: add on-screen keyboard for custom credential entry
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
-    lcd.print("WiFi Setup", 90, 10, COLOR_WHITE)
+    lcd.print("WiFi Setup",          90,  10, COLOR_WHITE)
     lcd.line(0, 35, 320, 35, COLOR_DIVIDER)
-    lcd.font(lcd.FONT_DejaVu18)
-    lcd.print("BtnA: home wifi",    10, 60,  COLOR_GREY)
-    lcd.print("BtnB: iot-unil",     10, 90,  COLOR_GREY)
-    lcd.print("BtnC: skip offline", 10, 120, COLOR_GREY)
+    lcd.print("BtnA: home wifi",     10,  60, COLOR_GREY)
+    lcd.print("BtnB: iot-unil",      10,  90, COLOR_GREY)
+    lcd.print("BtnC: skip offline",  10, 120, COLOR_GREY)
 
 # ============================================================
 # NTP
 # ============================================================
 
 def sync_ntp():
-    # Syncs device clock with NTP. UTC offset applied manually
-    # since MicroPython has no timezone support.
+    # Syncs device clock with NTP server.
+    # UTC offset applied manually — MicroPython has no timezone support.
     try:
         ntptime.settime()
         print("[NTP] Synced.")
@@ -151,8 +154,8 @@ def get_time_strings():
 # ============================================================
 
 def boot_sync():
-    # Fetches last known sensor + session values from BigQuery
-    # via middleware. Ensures display is never empty after reboot.
+    # Fetches last known values from BigQuery via middleware.
+    # Ensures display is never empty after reboot.
     try:
         r = urequests.get(MIDDLEWARE_URL + "/latest", timeout=5)
         if r.status_code == 200:
@@ -168,8 +171,8 @@ def boot_sync():
 # ============================================================
 
 def read_sensors():
-    # Each sensor wrapped independently — one failure does not
-    # prevent the others from being read.
+    # Each sensor is wrapped independently.
+    # One failure does not prevent the others from being read.
     try:
         state["temperature"] = env.temperature
         state["humidity"]    = env.humidity
@@ -223,7 +226,7 @@ def post_indoor_data():
 # ============================================================
 
 def fetch_weather():
-    # Gets current weather + forecast from middleware.
+    # Fetches current weather and forecast from middleware.
     # Forecast is displayed only — not stored in BigQuery.
     try:
         r = urequests.get(MIDDLEWARE_URL + "/weather", timeout=5)
@@ -239,19 +242,27 @@ def fetch_weather():
 # ============================================================
 
 def display_message(msg):
-    # Generic centered message — used during boot and errors.
+    # Generic message screen — used during boot and errors.
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print(msg, 10, 100, COLOR_WHITE)
 
 def air_color(label):
-    # Returns display color matching air quality label.
+    # Returns color matching air quality label.
     if label == "Good":     return COLOR_GOOD
     if label == "Moderate": return COLOR_WARN
     return COLOR_BAD
 
+def format_seconds(seconds):
+    # Converts seconds to "Xh Ym" or "Ymin" string.
+    if not seconds: return "0min"
+    m = int(seconds // 60)
+    h = int(m // 60)
+    m = m % 60
+    return "{}h {}m".format(h, m) if h > 0 else "{}min".format(m)
+
 def draw_main_screen():
-    # Layout: top bar (time) | weather | divider | indoor | session status
+    # Layout: top bar (time) | weather | divider | indoor | session status | nav
     lcd.clear(COLOR_BG)
 
     # Top bar
@@ -282,8 +293,8 @@ def draw_main_screen():
 
     # Session status
     if state["session_active"]:
-        label = "Paused" if state["session_paused"] else "{}".format(
-            format_seconds(state["session_work_sec"]))
+        label = "Paused" if state["session_paused"] \
+            else format_seconds(state["session_work_sec"])
         color = COLOR_WARN if state["session_paused"] else COLOR_GOOD
     else:
         label = "No session"
@@ -297,7 +308,7 @@ def draw_main_screen():
     lcd.print("[WiFi]",    240, 220, COLOR_GREY)
 
 def draw_session_screen():
-    # Shows session status, elapsed work time, and instructions.
+    # Shows session status and elapsed work time.
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print("Work Session", 80, 10, COLOR_WHITE)
@@ -307,7 +318,7 @@ def draw_session_screen():
         status = "PAUSED" if state["session_paused"] else "ACTIVE"
         color  = COLOR_WARN if state["session_paused"] else COLOR_GOOD
         lcd.print("Status: {}".format(status), 10, 60, color)
-        lcd.print("Work time: {}".format(
+        lcd.print("Work: {}".format(
             format_seconds(state["session_work_sec"])), 10, 95, COLOR_WHITE)
         lcd.print("Badge to end", 10, 130, COLOR_GREY)
     else:
@@ -317,21 +328,13 @@ def draw_session_screen():
     lcd.font(lcd.FONT_DejaVu12)
     lcd.print("[Back]", 10, 220, COLOR_GREY)
 
-def format_seconds(seconds):
-    # Converts seconds to "Xh Ym" or "Ym" string.
-    if seconds is None: return "0min"
-    m = int(seconds // 60)
-    h = int(m // 60)
-    m = m % 60
-    return "{}h {}m".format(h, m) if h > 0 else "{}min".format(m)
-
 # ============================================================
 # ALERTS
 # ============================================================
 
 def check_alerts():
-    # Triggered every loop. PIR presence required for all alerts.
-    # Each alert type has its own cooldown tracked in alert_times.
+    # PIR presence required for all alerts.
+    # Each alert type has its own cooldown in alert_times.
     if not state["motion"]:
         return
 
@@ -341,48 +344,46 @@ def check_alerts():
     if now - alert_times["weather"] > WEATHER_ANNOUNCE_INTERVAL:
         cond = state["weather"].get("condition", "unknown")
         temp = state["weather"].get("temp", "--")
-        speak("Current weather: {}, {}°C".format(cond, temp))
+        speak("Current weather: {}, {} degrees.".format(cond, temp))
         alert_times["weather"] = now
 
-    # Humidity — own cooldown
+    # Humidity alert
     h = state["humidity"]
     if h is not None and h < HUMIDITY_MIN:
         if now - alert_times["humidity"] > ALERT_COOLDOWN:
-            speak("Humidity is low at {}%. Consider using a humidifier.".format(round(h, 1)))
+            speak("Humidity is low at {}%. Consider using a humidifier.".format(
+                round(h, 1)))
             alert_times["humidity"] = now
 
-    # Air quality — initial alert + followup after 15min if still poor
+    # Air quality — initial + followup after 15min if still poor
     if state["air_quality_label"] == "Poor":
         time_since = now - alert_times["air_quality"]
         if time_since > ALERT_COOLDOWN:
-            speak("Air quality is poor. Open a window.")
+            speak("Air quality is poor. Please open a window.")
             alert_times["air_quality"] = now
         elif time_since > BREAK_FOLLOWUP_DELAY:
-            # Followup only fires once — reset timer after
             speak("Air quality is still poor. Please ventilate now.")
+            # Reset so next full cooldown applies
             alert_times["air_quality"] = now - ALERT_COOLDOWN + BREAK_FOLLOWUP_DELAY
 
-    # Break reminder — uses server-tracked work time, not local timer
-    # This correctly excludes pause durations
+    # Break reminder — uses server-tracked work time, correctly excludes pauses
     if state["session_active"] and not state["session_paused"]:
-        work_sec = state.get("session_work_sec", 0)
-        if work_sec > BREAK_REMINDER_INTERVAL:
+        if state["session_work_sec"] > BREAK_REMINDER_INTERVAL:
             time_since = now - alert_times["break"]
             if time_since > ALERT_COOLDOWN:
-                speak("You have been working for over an hour. Take a break!")
+                speak("You have been working for over an hour. Time for a break!")
                 alert_times["break"] = now
             elif time_since > BREAK_FOLLOWUP_DELAY:
-                speak("Please take a break. Your focus and health will improve.")
+                speak("Please take a break. Your focus will improve.")
                 alert_times["break"] = now - ALERT_COOLDOWN + BREAK_FOLLOWUP_DELAY
 
 # ============================================================
-# TTS / STT / LLM
+# TTS / STT
 # ============================================================
 
 def speak(text):
     # Sends text to middleware TTS endpoint.
-    # TODO: implement audio playback from M5Stack speaker
-    # once Pablo's /speak endpoint is ready.
+    # TODO: implement audio playback on M5Stack speaker once Pablo's endpoint is ready
     print("[TTS] {}".format(text))
     try:
         r = urequests.post(
@@ -397,7 +398,7 @@ def speak(text):
     gc.collect()
 
 def ask_question():
-    # Records from mic, sends audio to /ask endpoint.
+    # Records audio from mic, sends to /ask endpoint.
     # Middleware runs STT → LLM → TTS, returns audio response.
     # TODO: implement M5Stack Core2 microphone recording
     display_message("Listening...")
@@ -408,9 +409,8 @@ def ask_question():
 # ============================================================
 
 def fetch_session():
-    # Polls session state from middleware.
-    # M5Stack B posts session events (RFID/pause).
-    # M5Stack A reads the result and updates state.
+    # Polls current session state from middleware.
+    # M5Stack B posts session events — M5Stack A reads the result.
     try:
         r = urequests.get(MIDDLEWARE_URL + "/session/current", timeout=5)
         if r.status_code == 200:
@@ -451,7 +451,7 @@ def handle_buttons():
 # ============================================================
 
 def boot():
-    # Sequence: display splash → WiFi → NTP → sync → first draw
+    # Sequence: splash → WiFi → NTP → sync → first draw
     display_message("Booting...")
     time.sleep(1)
 
@@ -471,39 +471,50 @@ def boot():
 
 def loop():
     # Timer-based loop — no threads needed.
-    # Each action fires on its own interval.
+    # Each action fires independently on its own interval.
     last_sensor  = 0
     last_weather = 0
     last_session = 0
     last_clock   = 0
+    last_draw    = 0
 
     while True:
         now = time.time()
 
+        # Update clock every second
         if now - last_clock >= 1:
             state["time_str"], state["date_str"] = get_time_strings()
             last_clock = now
 
+        # Read and post sensor data every SENSOR_INTERVAL seconds
         if now - last_sensor >= SENSOR_INTERVAL:
             read_sensors()
             post_indoor_data()
             last_sensor = now
 
+        # Fetch weather every 10 minutes
         if now - last_weather >= 600:
             fetch_weather()
             last_weather = now
 
+        # Poll session state every 5 seconds
         if now - last_session >= 5:
             fetch_session()
             last_session = now
 
+        # Check PIR-triggered alerts every loop
         check_alerts()
+
+        # Handle physical button presses
         handle_buttons()
 
-        if current_screen == 0:
-            draw_main_screen()
-        elif current_screen == 1:
-            draw_session_screen()
+        # Redraw screen every DRAW_INTERVAL seconds to prevent flickering
+        if now - last_draw >= DRAW_INTERVAL:
+            if current_screen == 0:
+                draw_main_screen()
+            elif current_screen == 1:
+                draw_session_screen()
+            last_draw = now
 
         gc.collect()
         time.sleep(1)
