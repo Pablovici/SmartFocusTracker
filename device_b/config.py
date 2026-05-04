@@ -16,7 +16,7 @@ def _load_networks():
         with open("wifi_networks.json") as f:
             return ujson.load(f)
     except:
-        return [("iot-unil", "")]  # TODO: add iot-unil password when available
+        return [("iot-unil", "4u6uch4hpY9pJ2f9")]
 
 KNOWN_NETWORKS = _load_networks()
 
@@ -28,10 +28,4 @@ MIDDLEWARE_URL = "https://smartfocustracker-middleware-1054003632036.europe-west
 # ============================================================
 # SENSORS — Reading interval in seconds
 # ============================================================
-SENSOR_INTERVAL = 60  # How often TVOC is read and posted to middleware
-
-# ============================================================
-# I2C — Hardware pin configuration
-# ============================================================
-I2C_PORT_A_SCL = 22  # Port A SCL — RFID reader
-I2C_PORT_A_SDA = 21  # Port A SDA — RFID reader
+SENSOR_INTERVAL = 30  # How often data is read and posted to middleware
