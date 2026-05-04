@@ -1,9 +1,9 @@
 # device_b/main.py
-# Satellite device — no display interface.
+# Satellite device — RFID session management with session status display.
 # Responsibilities:
 #   - Read RFID badge → trigger session start/end
 #   - Button A → pause/resume session
-#   - Read TVOC/eCO2 → post to middleware every SENSOR_INTERVAL seconds
+#   - Display session status on screen
 # MicroPython — deployed via UIFlow 1.0
 
 import gc
@@ -11,12 +11,11 @@ import time
 import network
 import urequests
 import ujson
-from machine import I2C, SoftI2C, Pin
-from m5stack import btnA
+from machine import I2C, Pin
+from m5stack import lcd, btnA, btnB, btnC
 
-# TODO: confirm exact UIFlow import names on physical device
+# TODO: confirm exact UIFlow import name for RFID unit on physical device
 from rfid import RFIDUnit
-# from tvoc import TVOCUnit  # TODO: uncomment once confirmed
 
 from config import (
     KNOWN_NETWORKS, MIDDLEWARE_URL,
@@ -25,15 +24,24 @@ from config import (
 )
 
 # ============================================================
+# DISPLAY CONSTANTS
+# ============================================================
+COLOR_BG       = 0x1a1a2e
+COLOR_WHITE    = 0xFFFFFF
+COLOR_GREY     = 0xAAAAAA
+COLOR_DIVIDER  = 0x444444
+COLOR_GOOD     = 0x00CC44
+COLOR_WARN     = 0xFFAA00
+COLOR_BAD      = 0xFF4444
+COLOR_ACCENT   = 0x4fc3f7
+
+# ============================================================
 # HARDWARE INITIALIZATION
 # ============================================================
 
-# Port A — RFID reader
+# Port A — hardware I2C for RFID (no SoftI2C needed on device B)
 i2c_a = I2C(1, scl=Pin(I2C_PORT_A_SCL), sda=Pin(I2C_PORT_A_SDA), freq=100000)
 rfid  = RFIDUnit(i2c=i2c_a)
-
-# TODO: initialize TVOC once import name confirmed
-# tvoc = TVOCUnit(i2c=i2c_a)
 
 # ============================================================
 # GLOBAL STATE
@@ -41,7 +49,9 @@ rfid  = RFIDUnit(i2c=i2c_a)
 state = {
     "session_active": False,
     "session_paused": False,
-    "last_card_id":   None,  # Prevents double-reads of same badge
+    "work_seconds":   0,
+    "last_card_id":   None,
+    "wifi_connected": False,
 }
 
 # ============================================================
@@ -50,21 +60,97 @@ state = {
 
 def connect_wifi():
     # Tries each known network in order.
-    # No display — logs to console only.
+    # Shows connection progress on screen.
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
 
     for ssid, password in KNOWN_NETWORKS:
-        print("[WIFI] Trying:", ssid)
+        draw_status_screen("Connecting to\n{}...".format(ssid), COLOR_WARN)
         wlan.connect(ssid, password)
         for _ in range(10):
             if wlan.isconnected():
-                print("[WIFI] Connected to:", ssid)
+                state["wifi_connected"] = True
+                draw_status_screen("WiFi Connected!", COLOR_GOOD)
+                time.sleep(1)
                 return True
             time.sleep(1)
 
-    print("[WIFI] All networks failed. Running offline.")
+    state["wifi_connected"] = False
+    draw_status_screen("No WiFi.\nOffline mode.", COLOR_BAD)
+    time.sleep(2)
     return False
+
+# ============================================================
+# DISPLAY
+# ============================================================
+
+def draw_status_screen(message, color=0xFFFFFF):
+    # Generic centered message screen.
+    # Used during boot, WiFi connection and errors.
+    lcd.clear(COLOR_BG)
+    lcd.font(lcd.FONT_DejaVu18)
+    lcd.print(message, 10, 100, color)
+
+def draw_session_screen():
+    # Main screen showing session status.
+    # Clean, minimal layout with clear visual feedback.
+    lcd.clear(COLOR_BG)
+
+    # --- Header ---
+    lcd.font(lcd.FONT_DejaVu18)
+    lcd.print("FOCUS TRACKER", 70, 10, COLOR_ACCENT)
+    lcd.line(0, 35, 320, 35, COLOR_DIVIDER)
+
+    # --- Session status badge ---
+    if state["session_active"] and not state["session_paused"]:
+        status_text  = "WORKING"
+        status_color = COLOR_GOOD
+        icon         = "▶"
+    elif state["session_paused"]:
+        status_text  = "PAUSED"
+        status_color = COLOR_WARN
+        icon         = "||"
+    else:
+        status_text  = "NO SESSION"
+        status_color = COLOR_GREY
+        icon         = "■"
+
+    # Large status indicator
+    lcd.font(lcd.FONT_DejaVu24)
+    lcd.print("{} {}".format(icon, status_text), 60, 60, status_color)
+
+    # --- Work time ---
+    lcd.font(lcd.FONT_DejaVu18)
+    lcd.print("Work time: {}".format(
+        format_seconds(state["work_seconds"])), 10, 110, COLOR_WHITE)
+
+    # --- Divider ---
+    lcd.line(0, 140, 320, 140, COLOR_DIVIDER)
+
+    # --- Instructions ---
+    lcd.font(lcd.FONT_DejaVu18)
+    if not state["session_active"]:
+        lcd.print("Badge to start", 70, 155, COLOR_GREY)
+    else:
+        lcd.print("Badge to end", 80, 155, COLOR_GREY)
+        if state["session_paused"]:
+            lcd.print("BtnA to resume", 70, 180, COLOR_WARN)
+        else:
+            lcd.print("BtnA to pause", 75, 180, COLOR_WARN)
+
+    # --- WiFi indicator ---
+    wifi_color = COLOR_GOOD if state["wifi_connected"] else COLOR_BAD
+    wifi_text  = "WiFi ✓" if state["wifi_connected"] else "WiFi ✗"
+    lcd.font(lcd.FONT_DejaVu12)
+    lcd.print(wifi_text, 260, 225, wifi_color)
+
+def format_seconds(seconds):
+    # Converts seconds to "Xh Ym" or "Ymin" string.
+    if not seconds: return "0min"
+    m = int(seconds // 60)
+    h = int(m // 60)
+    m = m % 60
+    return "{}h {}m".format(h, m) if h > 0 else "{}min".format(m)
 
 # ============================================================
 # RFID
@@ -91,11 +177,13 @@ def handle_rfid(card_id):
         post_session_event("start", card_id)
         state["session_active"] = True
         state["session_paused"] = False
+        state["work_seconds"]   = 0
         print("[RFID] Session started:", card_id)
     else:
         post_session_event("end", card_id)
         state["session_active"] = False
         state["session_paused"] = False
+        state["work_seconds"]   = 0
         print("[RFID] Session ended:", card_id)
 
 # ============================================================
@@ -103,13 +191,12 @@ def handle_rfid(card_id):
 # ============================================================
 
 def handle_buttons():
-    # Button A toggles pause/resume during an active session.
-    # Ignored if no session is active.
+    # Button A — pause/resume active session
+    # Ignored if no session is active
     if btnA.wasPressed():
         if not state["session_active"]:
             print("[BTN] No active session.")
             return
-
         if state["session_paused"]:
             post_session_event("resume", None)
             state["session_paused"] = False
@@ -139,31 +226,20 @@ def post_session_event(event_type, card_id):
         print("[SESSION] Post failed:", e)
     gc.collect()
 
-def post_indoor_data(co2, tvoc_val, label):
-    # Posts TVOC/eCO2 readings to middleware.
-    payload = {
-        "co2_ppm":           co2,
-        "tvoc_ppb":          tvoc_val,
-        "air_quality_label": label,
-    }
+def fetch_session():
+    # Polls current session state from middleware.
+    # Updates local state so display stays in sync.
     try:
-        r = urequests.post(
-            MIDDLEWARE_URL + "/data/indoor",
-            headers={"Content-Type": "application/json"},
-            data=ujson.dumps(payload),
-            timeout=5
-        )
+        r = urequests.get(MIDDLEWARE_URL + "/session/current", timeout=5)
+        if r.status_code == 200:
+            data = ujson.loads(r.text)
+            state["session_active"] = data.get("active", False)
+            state["session_paused"] = data.get("paused", False)
+            state["work_seconds"]   = data.get("work_seconds", 0)
         r.close()
     except Exception as e:
-        print("[ENV] Post failed:", e)
+        print("[SESSION] Fetch failed:", e)
     gc.collect()
-
-def classify_air(co2):
-    # Maps CO2 ppm to human-readable label.
-    if co2 is None: return "Unknown"
-    if co2 < 800:   return "Good"
-    if co2 < 1000:  return "Moderate"
-    return "Poor"
 
 # ============================================================
 # BOOT SYNC
@@ -171,28 +247,24 @@ def classify_air(co2):
 
 def boot_sync():
     # Restores session state from middleware on startup.
-    # Ensures device B knows if a session was already active.
-    try:
-        r = urequests.get(MIDDLEWARE_URL + "/session/current", timeout=5)
-        if r.status_code == 200:
-            data = ujson.loads(r.text)
-            state["session_active"] = data.get("active", False)
-            state["session_paused"] = data.get("paused", False)
-            print("[SYNC] Session restored:", state["session_active"])
-        r.close()
-    except Exception as e:
-        print("[SYNC] Failed:", e)
-    gc.collect()
+    fetch_session()
+    print("[SYNC] Session restored:", state["session_active"])
 
 # ============================================================
 # BOOT
 # ============================================================
 
 def boot():
-    print("[BOOT] Starting device B...")
+    # Sequence: splash → WiFi → sync → draw
+    draw_status_screen("Booting...", COLOR_ACCENT)
+    time.sleep(1)
+
     connect_wifi()
-    boot_sync()
-    print("[BOOT] Ready.")
+    if state["wifi_connected"]:
+        boot_sync()
+
+    draw_session_screen()
+    print("[BOOT] Device B ready.")
 
 # ============================================================
 # MAIN LOOP
@@ -200,8 +272,12 @@ def boot():
 
 def loop():
     # Checks RFID and buttons every second.
-    # Posts environment data every SENSOR_INTERVAL seconds.
-    last_sensor = 0
+    # Polls session state every 5 seconds.
+    # Redraws screen every 5 seconds.
+    last_session = 0
+    last_draw    = 0
+    DRAW_INTERVAL    = 5
+    SESSION_INTERVAL = 5
 
     while True:
         now = time.time()
@@ -210,20 +286,20 @@ def loop():
         card_id = read_rfid()
         if card_id:
             handle_rfid(card_id)
+            draw_session_screen()  # Immediate redraw on badge event
 
         # Check pause/resume button
         handle_buttons()
 
-        # Read and post TVOC data on interval
-        if now - last_sensor >= SENSOR_INTERVAL:
-            # TODO: uncomment once TVOC import confirmed on physical device
-            # try:
-            #     co2      = tvoc.eCO2
-            #     tvoc_val = tvoc.TVOC
-            #     post_indoor_data(co2, tvoc_val, classify_air(co2))
-            # except Exception as e:
-            #     print("[TVOC] Read failed:", e)
-            last_sensor = now
+        # Poll session state from middleware
+        if now - last_session >= SESSION_INTERVAL:
+            fetch_session()
+            last_session = now
+
+        # Redraw screen on interval
+        if now - last_draw >= DRAW_INTERVAL:
+            draw_session_screen()
+            last_draw = now
 
         gc.collect()
         time.sleep(1)
