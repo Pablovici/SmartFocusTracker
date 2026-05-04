@@ -140,29 +140,31 @@ def start_session(card_id):
     return session_id
 
 def end_session(session_id, total_work_minutes, pauses):
-    # Updates an existing session row with end time and work duration.
-    # BigQuery does not support UPDATE directly on streaming inserts —
-    # we use DML UPDATE via a query job instead.
+    # Updates session row with end time and work duration.
+    # Uses query parameters to prevent SQL injection.
     sql = """
         UPDATE `{}`
-        SET end_time = '{}',
-            total_work_minutes = {},
-            pauses = '{}'
-        WHERE session_id = '{}'
-    """.format(
-        TABLE_SESSIONS,
-        now_utc(),
-        total_work_minutes,
-        pauses,
-        session_id
-    )
-    client.query(sql).result()
+        SET end_time           = @end_time,
+            total_work_minutes = @minutes,
+            pauses             = @pauses
+        WHERE session_id = @session_id
+    """.format(TABLE_SESSIONS)
+
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("end_time",    "TIMESTAMP", now_utc()),
+        bigquery.ScalarQueryParameter("minutes",     "FLOAT64",   total_work_minutes),
+        bigquery.ScalarQueryParameter("pauses",      "STRING",    pauses),
+        bigquery.ScalarQueryParameter("session_id",  "STRING",    session_id),
+    ])
+    client.query(sql, job_config=job_config).result()
 
 def get_current_session():
-    # Returns the most recent session that has not ended yet.
-    # Used by GET /session/current for both M5Stacks.
+    # Returns the most recent open session.
+    # Includes start_time_unix for in-memory state restoration.
     sql = """
-        SELECT session_id, rfid_card_id, start_time, pauses
+        SELECT session_id, rfid_card_id, pauses,
+               start_time,
+               UNIX_SECONDS(start_time) AS start_time_unix
         FROM `{}`
         WHERE end_time IS NULL
         ORDER BY start_time DESC
