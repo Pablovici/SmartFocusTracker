@@ -1,47 +1,58 @@
 # device_b/main.py
 # Satellite device — RFID session management with session status display.
 # Responsibilities:
-#   - Read RFID badge → trigger session start/end
+#   - Read RFID badge → trigger session start/end via middleware
 #   - Button A → pause/resume session
 #   - Display session status on screen
 # MicroPython — deployed via UIFlow 1.0
+# Assigned to: Amir
 
 import gc
+import sys
 import time
 import network
 import urequests
 import ujson
-from machine import I2C, Pin
+import unit
 from m5stack import lcd, btnA, btnB, btnC
 
-# TODO: confirm exact UIFlow import name for RFID unit on physical device
-from rfid import RFIDUnit
-
-from config import (
-    KNOWN_NETWORKS, MIDDLEWARE_URL,
-    SENSOR_INTERVAL,
-    I2C_PORT_A_SCL, I2C_PORT_A_SDA
-)
+sys.path.append('/flash')
+from device_config import KNOWN_NETWORKS, MIDDLEWARE_URL, SENSOR_INTERVAL
 
 # ============================================================
 # DISPLAY CONSTANTS
 # ============================================================
-COLOR_BG       = 0x1a1a2e
-COLOR_WHITE    = 0xFFFFFF
-COLOR_GREY     = 0xAAAAAA
-COLOR_DIVIDER  = 0x444444
-COLOR_GOOD     = 0x00CC44
-COLOR_WARN     = 0xFFAA00
-COLOR_BAD      = 0xFF4444
-COLOR_ACCENT   = 0x4fc3f7
+COLOR_BG        = 0x1a1a2e
+COLOR_WHITE     = 0xFFFFFF
+COLOR_GREY_SOFT = 0x999999
+COLOR_GREY_DIM  = 0x666666
+COLOR_DIVIDER   = 0x3a3a5e
+COLOR_GOOD      = 0x00CC44
+COLOR_WARN      = 0xFFAA00
+COLOR_BAD       = 0xFF4444
+COLOR_ACCENT    = 0x4fc3f7
+COLOR_WIFI      = 0x334455
+
+SCREEN_W = 320
+SCREEN_H = 240
 
 # ============================================================
 # HARDWARE INITIALIZATION
 # ============================================================
 
-# Port A — hardware I2C for RFID (no SoftI2C needed on device B)
-i2c_a = I2C(1, scl=Pin(I2C_PORT_A_SCL), sda=Pin(I2C_PORT_A_SDA), freq=100000)
-rfid  = RFIDUnit(i2c=i2c_a)
+# Port A — RFID RC522 via UIFlow unit system.
+# Device B serves no purpose without RFID — halt with clear error if not detected.
+try:
+    rfid = unit.get(unit.RFID, (21, 22))
+    print("[RFID] Init OK")
+except Exception as e:
+    lcd.clear(0x1a1a2e)
+    lcd.font(lcd.FONT_DejaVu18)
+    lcd.print("RFID NOT FOUND", 40, 90, 0xFF4444)
+    lcd.print("Check Port A cable", 20, 120, 0x999999)
+    lcd.print(str(e), 10, 150, 0x666666)
+    print("[RFID] Fatal:", e)
+    raise SystemExit("RFID required — check Grove cable on Port A")
 
 # ============================================================
 # GLOBAL STATE
@@ -50,8 +61,15 @@ state = {
     "session_active": False,
     "session_paused": False,
     "work_seconds":   0,
-    "last_card_id":   None,
+    "last_card_id":   None,  # Prevents double-reads of same badge
     "wifi_connected": False,
+}
+
+_last_drawn = {
+    "session_active": None,
+    "session_paused": None,
+    "work_seconds":   -1,
+    "wifi_connected": None,
 }
 
 # ============================================================
@@ -65,106 +83,164 @@ def connect_wifi():
     wlan.active(True)
 
     for ssid, password in KNOWN_NETWORKS:
-        draw_status_screen("Connecting to\n{}...".format(ssid), COLOR_WARN)
+        _draw_boot_msg("Connecting...\n{}".format(ssid))
         wlan.connect(ssid, password)
         for _ in range(10):
             if wlan.isconnected():
                 state["wifi_connected"] = True
-                draw_status_screen("WiFi Connected!", COLOR_GOOD)
+                _draw_boot_msg("Connected!")
                 time.sleep(1)
                 return True
             time.sleep(1)
 
     state["wifi_connected"] = False
-    draw_status_screen("No WiFi.\nOffline mode.", COLOR_BAD)
+    _draw_boot_msg("No WiFi - offline")
     time.sleep(2)
     return False
 
 # ============================================================
-# DISPLAY
+# DISPLAY HELPERS
 # ============================================================
 
-def draw_status_screen(message, color=0xFFFFFF):
-    # Generic centered message screen.
-    # Used during boot, WiFi connection and errors.
+def _draw_boot_msg(msg):
+    # Minimal boot screen.
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
-    lcd.print(message, 10, 100, color)
+    lcd.print(msg, 10, 100, COLOR_ACCENT)
+
+def _cx(text, char_w, offset=0):
+    # Centers text horizontally with optional drift correction offset.
+    return max(0, (SCREEN_W - len(text) * char_w) // 2 + offset)
+
+def _draw_header():
+    # Shared header bar — same on both screens.
+    lcd.font(lcd.FONT_DejaVu18)
+    header = "- FOCUS TRACKER -"
+    lcd.print(header, _cx(header, 11, -4), 10, COLOR_ACCENT)
+    lcd.line(0, 32, SCREEN_W, 32, COLOR_DIVIDER)
+
+def _draw_wifi_indicator():
+    # Subtle WiFi status — only draws attention when disconnected.
+    lcd.font(lcd.FONT_DejaVu18)
+    if state["wifi_connected"]:
+        lcd.print("WiFi OK", _cx("WiFi OK", 11, -4), 220, COLOR_WIFI)
+    else:
+        lcd.print("No WiFi", _cx("No WiFi", 11, -4), 220, COLOR_BAD)
+
+def _draw_bottom_bar(left_text, right_text, left_color, right_color):
+    # Compact bottom action bar — same visual weight as header.
+    lcd.line(0, 196, SCREEN_W, 196, COLOR_DIVIDER)
+    lcd.font(lcd.FONT_DejaVu18)
+    lcd.print(left_text,  12,  202, left_color)
+    lcd.print(right_text, 168, 202, right_color)
+
+# ============================================================
+# IDLE SCREEN
+# ============================================================
+
+def draw_idle_screen():
+    # Shown when no session active.
+    # Single bold call to action — nothing else to distract.
+    lcd.clear(COLOR_BG)
+    _draw_header()
+
+    # "TAP TO" — soft grey, secondary
+    lcd.font(lcd.FONT_DejaVu40)
+    line1 = "TAP TO"
+    lcd.print(line1, _cx(line1, 26, -6), 72, COLOR_GREY_SOFT)
+
+    # "START" — accent blue, dominant action word
+    lcd.font(lcd.FONT_DejaVu56)
+    line2 = "START"
+    lcd.print(line2, _cx(line2, 34, -8), 130, COLOR_ACCENT)
+
+    _draw_wifi_indicator()
+    _update_last_drawn()
+
+# ============================================================
+# ACTIVE SESSION SCREEN
+# ============================================================
 
 def draw_session_screen():
-    # Main screen showing session status.
-    # Clean, minimal layout with clear visual feedback.
+    # Full redraw — called only when status or wifi changes.
     lcd.clear(COLOR_BG)
+    _draw_header()
 
-    # --- Header ---
-    lcd.font(lcd.FONT_DejaVu18)
-    lcd.print("FOCUS TRACKER", 70, 10, COLOR_ACCENT)
-    lcd.line(0, 35, 320, 35, COLOR_DIVIDER)
-
-    # --- Session status badge ---
-    if state["session_active"] and not state["session_paused"]:
-        status_text  = "WORKING"
-        status_color = COLOR_GOOD
-        icon         = "▶"
-    elif state["session_paused"]:
+    # Status — DejaVu56, vertically centered in available space
+    if state["session_paused"]:
         status_text  = "PAUSED"
         status_color = COLOR_WARN
-        icon         = "||"
     else:
-        status_text  = "NO SESSION"
-        status_color = COLOR_GREY
-        icon         = "■"
+        status_text  = "WORKING"
+        status_color = COLOR_GOOD
 
-    # Large status indicator
+    lcd.font(lcd.FONT_DejaVu56)
+    lcd.print(status_text, _cx(status_text, 34, -12), 64, status_color)
+
+    # Work time — DejaVu24, below status
+    _draw_time_zone(format_seconds(state["work_seconds"]))
+
+    # Bottom bar
+    if state["session_paused"]:
+        _draw_bottom_bar("RESUME", "TAP TO END", COLOR_WARN, COLOR_GREY_DIM)
+    else:
+        _draw_bottom_bar("PAUSE",  "TAP TO END", COLOR_WARN, COLOR_GREY_DIM)
+
+    _draw_wifi_indicator()
+    _update_last_drawn()
+
+def _draw_time_zone(work_str):
+    # Partial redraw — clears only time zone to prevent flickering.
+    lcd.fillRect(0, 134, SCREEN_W, 40, COLOR_BG)
     lcd.font(lcd.FONT_DejaVu24)
-    lcd.print("{} {}".format(icon, status_text), 60, 60, status_color)
+    lcd.print(work_str, _cx(work_str, 15, -4), 138, COLOR_WHITE)
 
-    # --- Work time ---
-    lcd.font(lcd.FONT_DejaVu18)
-    lcd.print("Work time: {}".format(
-        format_seconds(state["work_seconds"])), 10, 110, COLOR_WHITE)
-
-    # --- Divider ---
-    lcd.line(0, 140, 320, 140, COLOR_DIVIDER)
-
-    # --- Instructions ---
-    lcd.font(lcd.FONT_DejaVu18)
-    if not state["session_active"]:
-        lcd.print("Badge to start", 70, 155, COLOR_GREY)
-    else:
-        lcd.print("Badge to end", 80, 155, COLOR_GREY)
-        if state["session_paused"]:
-            lcd.print("BtnA to resume", 70, 180, COLOR_WARN)
-        else:
-            lcd.print("BtnA to pause", 75, 180, COLOR_WARN)
-
-    # --- WiFi indicator ---
-    wifi_color = COLOR_GOOD if state["wifi_connected"] else COLOR_BAD
-    wifi_text  = "WiFi ✓" if state["wifi_connected"] else "WiFi ✗"
-    lcd.font(lcd.FONT_DejaVu12)
-    lcd.print(wifi_text, 260, 225, wifi_color)
+def draw_time_only():
+    # Called every second — partial update, no flicker.
+    _draw_time_zone(format_seconds(state["work_seconds"]))
+    _last_drawn["work_seconds"] = state["work_seconds"]
 
 def format_seconds(seconds):
-    # Converts seconds to "Xh Ym" or "Ymin" string.
-    if not seconds: return "0min"
-    m = int(seconds // 60)
-    h = int(m // 60)
+    # Converts seconds to "Xh Ym Zs", "Ym Zs" or "Zs".
+    if not seconds: return "0s"
+    s = int(seconds) % 60
+    m = int(seconds) // 60
+    h = m // 60
     m = m % 60
-    return "{}h {}m".format(h, m) if h > 0 else "{}min".format(m)
+    if h > 0: return "{}h {}m {}s".format(h, m, s)
+    if m > 0: return "{}m {}s".format(m, s)
+    return "{}s".format(s)
+
+def _update_last_drawn():
+    _last_drawn["session_active"] = state["session_active"]
+    _last_drawn["session_paused"] = state["session_paused"]
+    _last_drawn["wifi_connected"] = state["wifi_connected"]
+    _last_drawn["work_seconds"]   = state["work_seconds"]
+
+def _status_changed():
+    return (
+        state["session_active"] != _last_drawn["session_active"] or
+        state["session_paused"] != _last_drawn["session_paused"] or
+        state["wifi_connected"] != _last_drawn["wifi_connected"]
+    )
+
+def _time_changed():
+    return state["work_seconds"] != _last_drawn["work_seconds"]
 
 # ============================================================
 # RFID
 # ============================================================
 
 def read_rfid():
-    # Returns card ID string if a new card is detected, None otherwise.
-    # Resets last_card_id when card is removed to allow re-reading.
+    # Returns card UID string if a new card is detected, None otherwise.
+    # Filters repeated reads — card must be removed before re-reading.
     try:
-        if rfid.isNewCardPresent() and rfid.readCardSerial():
-            card_id = str(rfid.uid.uidByte)
-            if card_id != state["last_card_id"]:
-                state["last_card_id"] = card_id
-                return card_id
+        if rfid.isNewCardPresent():
+            if rfid.readCardSerial():
+                card_id = rfid.getCardUID()
+                if card_id != state["last_card_id"]:
+                    state["last_card_id"] = card_id
+                    return card_id
     except Exception as e:
         print("[RFID] Read failed:", e)
 
@@ -172,7 +248,7 @@ def read_rfid():
     return None
 
 def handle_rfid(card_id):
-    # Toggle logic: first badge starts session, second badge ends it.
+    # Toggle logic: first tap starts session, second tap ends it.
     if not state["session_active"]:
         post_session_event("start", card_id)
         state["session_active"] = True
@@ -191,11 +267,10 @@ def handle_rfid(card_id):
 # ============================================================
 
 def handle_buttons():
-    # Button A — pause/resume active session
-    # Ignored if no session is active
+    # Button A — pause/resume active session only.
+    # Ignored if no session is active.
     if btnA.wasPressed():
         if not state["session_active"]:
-            print("[BTN] No active session.")
             return
         if state["session_paused"]:
             post_session_event("resume", None)
@@ -211,7 +286,7 @@ def handle_buttons():
 # ============================================================
 
 def post_session_event(event_type, card_id):
-    # Posts a session lifecycle event to middleware.
+    # Posts session lifecycle event to middleware.
     # event_type: "start" | "pause" | "resume" | "end"
     payload = {"event": event_type, "card_id": card_id}
     try:
@@ -228,9 +303,12 @@ def post_session_event(event_type, card_id):
 
 def fetch_session():
     # Polls current session state from middleware.
-    # Updates local state so display stays in sync.
+    # Keeps local state in sync with server.
     try:
-        r = urequests.get(MIDDLEWARE_URL + "/session/current", timeout=5)
+        r = urequests.get(
+            MIDDLEWARE_URL + "/session/current",
+            timeout=5
+        )
         if r.status_code == 200:
             data = ujson.loads(r.text)
             state["session_active"] = data.get("active", False)
@@ -247,6 +325,7 @@ def fetch_session():
 
 def boot_sync():
     # Restores session state from middleware on startup.
+    # Ensures device B reflects correct state after reboot.
     fetch_session()
     print("[SYNC] Session restored:", state["session_active"])
 
@@ -255,15 +334,19 @@ def boot_sync():
 # ============================================================
 
 def boot():
-    # Sequence: splash → WiFi → sync → draw
-    draw_status_screen("Booting...", COLOR_ACCENT)
+    # Sequence: splash → WiFi → sync → first draw
+    _draw_boot_msg("Booting...")
     time.sleep(1)
 
     connect_wifi()
     if state["wifi_connected"]:
         boot_sync()
 
-    draw_session_screen()
+    if state["session_active"]:
+        draw_session_screen()
+    else:
+        draw_idle_screen()
+
     print("[BOOT] Device B ready.")
 
 # ============================================================
@@ -271,35 +354,40 @@ def boot():
 # ============================================================
 
 def loop():
-    # Checks RFID and buttons every second.
-    # Polls session state every 5 seconds.
-    # Redraws screen every 5 seconds.
-    last_session = 0
-    last_draw    = 0
-    DRAW_INTERVAL    = 5
+    # Full redraw on status change.
+    # Partial time-only redraw every second when active.
+    # No redraw when idle and nothing changed.
+    last_session     = 0
     SESSION_INTERVAL = 5
 
     while True:
         now = time.time()
 
-        # Check for RFID badge
+        # Check for RFID tap — immediate redraw on detection
         card_id = read_rfid()
         if card_id:
             handle_rfid(card_id)
-            draw_session_screen()  # Immediate redraw on badge event
 
         # Check pause/resume button
         handle_buttons()
 
-        # Poll session state from middleware
+        # Poll session state from middleware every 5 seconds
         if now - last_session >= SESSION_INTERVAL:
             fetch_session()
             last_session = now
 
-        # Redraw screen on interval
-        if now - last_draw >= DRAW_INTERVAL:
-            draw_session_screen()
-            last_draw = now
+        # Increment work time when active and not paused
+        if state["session_active"] and not state["session_paused"]:
+            state["work_seconds"] = (state["work_seconds"] or 0) + 1
+
+        # Smart redraw — full on status change, partial on time change
+        if _status_changed():
+            if state["session_active"]:
+                draw_session_screen()
+            else:
+                draw_idle_screen()
+        elif state["session_active"] and _time_changed():
+            draw_time_only()
 
         gc.collect()
         time.sleep(1)
