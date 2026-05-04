@@ -16,7 +16,7 @@ def _load_networks():
         with open("wifi_networks.json") as f:
             return ujson.load(f)
     except:
-        return [("iot-unil", "")]  # TODO: add iot-unil password when available
+        return [("iot-unil", "4u6uch4hpY9pJ2f9")]
 
 KNOWN_NETWORKS = _load_networks()
 
