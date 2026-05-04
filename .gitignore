@@ -1,20 +1,28 @@
-# Clé secrète GCP
-gcp_service_account.json
-
-# Variables d'environnement locales
+# Environment variables
 .env
 
-# Python
+# Google Cloud service account
+gcp_service_account.json
+
+#Wifi credentials
+wifi_networks.json
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
-.venv/
-venv/
-
-# OS
-.DS_Store
-Thumbs.db
 
 # IDE
 .vscode/
 .idea/
+
+# macOS system files
+.DS_Store
+
+# Streamlit cache
+.streamlit/
