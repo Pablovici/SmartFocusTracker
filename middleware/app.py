@@ -1,12 +1,13 @@
 # middleware/app.py
 # Flask API — main entry point for the middleware layer.
 # Receives data from M5Stack devices and serves data to Streamlit dashboard.
-# All business logic is delegated to service modules.
 # Assigned to: Pablo
 
 import os
 import json
 import time
+import uuid
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -19,19 +20,19 @@ from llm_service import answer_question
 # APP INITIALIZATION
 # ============================================================
 
-# Load environment variables from .env before anything else.
 load_dotenv()
-
 app = Flask(__name__)
 
 # ============================================================
 # SESSION STATE
-# In-memory session tracker — faster than BigQuery for real-time updates.
-# Restored from BigQuery on startup to survive Cloud Run restarts.
+# In-memory session tracker — faster than BigQuery for real-time.
+# Session is only written to BigQuery once, at the end.
+# This avoids the BigQuery streaming buffer DML UPDATE limitation.
 # ============================================================
 
 _session = {
     "session_id":   None,
+    "card_id":      None,
     "active":       False,
     "paused":       False,
     "work_seconds": 0,
@@ -42,11 +43,11 @@ _session = {
 
 def _restore_session():
     # Called once at module load.
-    # If Cloud Run restarts mid-session, this restores the active session
-    # from BigQuery so state is never permanently lost.
+    # If Cloud Run restarts mid-session, restores active session from BigQuery.
     existing = bq.get_current_session()
     if existing:
         _session["session_id"] = existing["session_id"]
+        _session["card_id"]    = existing.get("rfid_card_id")
         _session["active"]     = True
         _session["paused"]     = False
         _session["work_start"] = existing.get("start_time_unix", time.time())
@@ -66,10 +67,9 @@ def health():
 
 # ============================================================
 # SENSOR DATA
-# Single route accepts partial payloads from both devices.
+# Single route accepts partial payloads from both M5Stack devices.
 # device_a posts: temperature, humidity, motion_detected
 # device_b posts: co2_ppm, tvoc_ppb, air_quality_label
-# Missing fields default to None in BigQuery.
 # ============================================================
 
 @app.route("/data/indoor", methods=["POST"])
@@ -78,11 +78,9 @@ def post_indoor():
     data = request.get_json()
     if not data:
         return jsonify({"error": "No data provided"}), 400
-
     success = bq.insert_indoor(data)
     if not success:
         return jsonify({"error": "BigQuery insert failed"}), 500
-
     return jsonify({"status": "ok"}), 200
 
 # ============================================================
@@ -117,20 +115,18 @@ def weather():
 
 @app.route("/session/start", methods=["POST"])
 def session_start():
-    # Starts a new work session.
-    # Creates BigQuery row and initializes in-memory state.
+    # Starts a new work session in memory only.
+    # BigQuery insert happens only at session end.
     data    = request.get_json()
     card_id = data.get("card_id") if data else None
 
     if _session["active"]:
         return jsonify({"error": "Session already active"}), 400
 
-    session_id = bq.start_session(card_id)
-    if not session_id:
-        return jsonify({"error": "Failed to create session"}), 500
-
+    session_id = str(uuid.uuid4())
     _session.update({
         "session_id":   session_id,
+        "card_id":      card_id,
         "active":       True,
         "paused":       False,
         "work_seconds": 0,
@@ -160,7 +156,6 @@ def session_resume():
 
     pause_end      = time.time()
     pause_duration = pause_end - _session["pause_start"]
-
     _session["pauses"].append({
         "pause_start":  _session["pause_start"],
         "pause_end":    pause_end,
@@ -173,9 +168,8 @@ def session_resume():
 
 @app.route("/session/end", methods=["POST"])
 def session_end():
-    # Ends the active session.
-    # Calculates total work time excluding all pauses.
-    # Updates BigQuery row with final values.
+    # Ends the active session and saves complete record to BigQuery.
+    # Only insert happens here — avoids streaming buffer UPDATE issue.
     if not _session["active"]:
         return jsonify({"error": "No active session"}), 400
 
@@ -189,21 +183,30 @@ def session_end():
             "duration_sec": pause_duration,
         })
 
-    # work time = total elapsed - sum of all pause durations
+    # Calculate total work time excluding all pauses
     elapsed      = time.time() - _session["work_start"]
     total_pause  = sum(p["duration_sec"] for p in _session["pauses"])
     work_minutes = round((elapsed - total_pause) / 60, 2)
 
-    bq.end_session(
-        _session["session_id"],
-        work_minutes,
-        json.dumps(_session["pauses"])
+    # Convert start time to ISO string for BigQuery
+    start_iso = datetime.fromtimestamp(
+        _session["work_start"], tz=timezone.utc).isoformat()
+
+    # Save complete session to BigQuery in one insert
+    bq.save_complete_session(
+        session_id         = _session["session_id"],
+        card_id            = _session["card_id"],
+        start_time         = start_iso,
+        end_time           = bq.now_utc(),
+        total_work_minutes = work_minutes,
+        pauses             = json.dumps(_session["pauses"])
     )
     print("[SESSION] Ended. Work minutes:", work_minutes)
 
     # Reset in-memory state
     _session.update({
         "session_id":   None,
+        "card_id":      None,
         "active":       False,
         "paused":       False,
         "work_seconds": 0,
@@ -216,7 +219,6 @@ def session_end():
 @app.route("/session/current", methods=["GET"])
 def session_current():
     # Returns real-time session state for M5Stack A display.
-    # work_seconds is calculated live — excludes pauses.
     work_sec = 0
     if _session["active"] and not _session["paused"] and _session["work_start"]:
         elapsed     = time.time() - _session["work_start"]
@@ -286,25 +288,30 @@ def ask():
 
 @app.route("/history/indoor", methods=["GET"])
 def history_indoor():
+    # Returns indoor sensor history for Streamlit dashboard.
     days = request.args.get("days", 7, type=int)
     return jsonify(bq.get_indoor_history(days)), 200
 
 @app.route("/history/outdoor", methods=["GET"])
 def history_outdoor():
+    # Returns outdoor weather history for Streamlit dashboard.
     days = request.args.get("days", 7, type=int)
     return jsonify(bq.get_outdoor_history(days)), 200
 
 @app.route("/history/sessions", methods=["GET"])
 def history_sessions():
+    # Returns recent completed work sessions for Streamlit dashboard.
     limit = request.args.get("limit", 20, type=int)
     return jsonify(bq.get_session_history(limit)), 200
 
 @app.route("/history/session-stats", methods=["GET"])
 def session_stats():
+    # Returns aggregate session statistics for Streamlit dashboard.
     return jsonify(bq.get_session_stats()), 200
 
 @app.route("/history/alerts", methods=["GET"])
 def history_alerts():
+    # Returns recent alerts for Streamlit dashboard.
     limit = request.args.get("limit", 10, type=int)
     return jsonify(bq.get_recent_alerts(limit)), 200
 

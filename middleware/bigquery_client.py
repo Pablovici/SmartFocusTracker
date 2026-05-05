@@ -1,6 +1,6 @@
 # middleware/bigquery_client.py
 # Handles all BigQuery read and write operations.
-# All other middleware files import from here — never directly from google.cloud.bigquery.
+# All other middleware files import from here.
 # Assigned to: Pablo
 
 import os
@@ -12,15 +12,12 @@ from google.cloud import bigquery
 # CLIENT INITIALIZATION
 # ============================================================
 
-# BigQuery client is initialized once at module load.
-# Credentials are loaded automatically from the path defined
-# in GOOGLE_APPLICATION_CREDENTIALS environment variable.
+# BigQuery client initialized once at module load.
+# Credentials loaded automatically from GOOGLE_APPLICATION_CREDENTIALS.
 client = bigquery.Client(project=os.environ["GCP_PROJECT_ID"])
 
-# Dataset and table references built from environment variables.
-# Never hardcoded — changing .env is enough to retarget a different dataset.
-DATASET = os.environ["GCP_DATASET_ID"]
-
+# Table references built from environment variables.
+DATASET        = os.environ["GCP_DATASET_ID"]
 TABLE_INDOOR   = "{}.{}".format(DATASET, os.environ["BQ_TABLE_INDOOR"])
 TABLE_OUTDOOR  = "{}.{}".format(DATASET, os.environ["BQ_TABLE_OUTDOOR"])
 TABLE_SESSIONS = "{}.{}".format(DATASET, os.environ["BQ_TABLE_SESSIONS"])
@@ -31,12 +28,11 @@ TABLE_ALERTS   = "{}.{}".format(DATASET, os.environ["BQ_TABLE_ALERTS"])
 # ============================================================
 
 def now_utc():
-    # Returns current UTC time as a BigQuery-compatible string.
+    # Returns current UTC time as a BigQuery-compatible ISO string.
     return datetime.now(timezone.utc).isoformat()
 
 def run_query(sql):
-    # Executes a parameterless SQL query and returns results as a list of dicts.
-    # Used for all SELECT operations throughout the middleware.
+    # Executes a SQL query and returns results as a list of dicts.
     query_job = client.query(sql)
     return [dict(row) for row in query_job.result()]
 
@@ -45,8 +41,9 @@ def run_query(sql):
 # ============================================================
 
 def insert_indoor(data):
-    # Inserts one row of indoor sensor data into BigQuery.
-    # Called by Flask route POST /data/indoor.
+    # Inserts one row of indoor sensor data.
+    # Accepts partial payloads — missing fields default to None.
+    # Called by both M5Stack A (ENVIII + PIR) and M5Stack B (TVOC).
     row = {
         "timestamp":         now_utc(),
         "temperature":       data.get("temperature"),
@@ -90,16 +87,16 @@ def get_indoor_history(days=7):
 # ============================================================
 
 def insert_outdoor(data):
-    # Inserts one outdoor weather snapshot into BigQuery.
+    # Inserts one outdoor weather snapshot.
     # Called whenever Flask fetches fresh data from OpenWeatherMap.
     row = {
-        "timestamp": now_utc(),
-        "city":      data.get("city"),
+        "timestamp":   now_utc(),
+        "city":        data.get("city"),
         "temperature": data.get("temperature"),
-        "humidity":  data.get("humidity"),
-        "condition": data.get("condition"),
-        "wind_speed": data.get("wind_speed"),
-        "icon_code": data.get("icon_code"),
+        "humidity":    data.get("humidity"),
+        "condition":   data.get("condition"),
+        "wind_speed":  data.get("wind_speed"),
+        "icon_code":   data.get("icon_code"),
     }
     errors = client.insert_rows_json(TABLE_OUTDOOR, [row])
     if errors:
@@ -108,7 +105,6 @@ def insert_outdoor(data):
 
 def get_outdoor_history(days=7):
     # Returns outdoor weather history for the last N days.
-    # Used by Streamlit dashboard.
     sql = """
         SELECT timestamp, temperature, humidity, condition, wind_speed
         FROM `{}`
@@ -121,49 +117,30 @@ def get_outdoor_history(days=7):
 # WORK SESSIONS
 # ============================================================
 
-def start_session(card_id):
-    # Creates a new work session row in BigQuery.
-    # Returns the generated session_id for future updates.
-    session_id = str(uuid.uuid4())
+def save_complete_session(session_id, card_id, start_time,
+                           end_time, total_work_minutes, pauses):
+    # Inserts the complete session record in one shot at session end.
+    # This avoids the BigQuery streaming buffer DML UPDATE limitation —
+    # rows inserted via streaming cannot be updated with DML for ~90 minutes.
+    # By only inserting when the session ends, we get a clean complete record.
     row = {
         "session_id":         session_id,
         "rfid_card_id":       card_id,
-        "start_time":         now_utc(),
-        "end_time":           None,
-        "total_work_minutes": None,
-        "pauses":             "[]",  # JSON string — empty list initially
+        "start_time":         start_time,
+        "end_time":           end_time,
+        "total_work_minutes": total_work_minutes,
+        "pauses":             pauses,
     }
     errors = client.insert_rows_json(TABLE_SESSIONS, [row])
     if errors:
-        print("[BQ] start_session errors:", errors)
-        return None
-    return session_id
-
-def end_session(session_id, total_work_minutes, pauses):
-    # Updates session row with end time and work duration.
-    # Uses query parameters to prevent SQL injection.
-    sql = """
-        UPDATE `{}`
-        SET end_time           = @end_time,
-            total_work_minutes = @minutes,
-            pauses             = @pauses
-        WHERE session_id = @session_id
-    """.format(TABLE_SESSIONS)
-
-    job_config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("end_time",    "TIMESTAMP", now_utc()),
-        bigquery.ScalarQueryParameter("minutes",     "FLOAT64",   total_work_minutes),
-        bigquery.ScalarQueryParameter("pauses",      "STRING",    pauses),
-        bigquery.ScalarQueryParameter("session_id",  "STRING",    session_id),
-    ])
-    client.query(sql, job_config=job_config).result()
+        print("[BQ] save_complete_session errors:", errors)
+    return len(errors) == 0
 
 def get_current_session():
-    # Returns the most recent open session.
-    # Includes start_time_unix for in-memory state restoration.
+    # Returns the most recent session that has not ended yet.
+    # Used by GET /session/current for both M5Stacks.
     sql = """
-        SELECT session_id, rfid_card_id, pauses,
-               start_time,
+        SELECT session_id, rfid_card_id, start_time, pauses,
                UNIX_SECONDS(start_time) AS start_time_unix
         FROM `{}`
         WHERE end_time IS NULL
@@ -188,13 +165,12 @@ def get_session_history(limit=20):
 
 def get_session_stats():
     # Returns aggregate session statistics for the Streamlit dashboard.
-    # Includes average work time, total sessions, and total work minutes.
     sql = """
         SELECT
-            COUNT(*)                        AS total_sessions,
-            AVG(total_work_minutes)         AS avg_work_minutes,
-            SUM(total_work_minutes)         AS total_work_minutes,
-            MAX(total_work_minutes)         AS longest_session_minutes
+            COUNT(*)                AS total_sessions,
+            AVG(total_work_minutes) AS avg_work_minutes,
+            SUM(total_work_minutes) AS total_work_minutes,
+            MAX(total_work_minutes) AS longest_session_minutes
         FROM `{}`
         WHERE end_time IS NOT NULL
     """.format(TABLE_SESSIONS)
@@ -207,7 +183,6 @@ def get_session_stats():
 
 def insert_alert(alert_type, message):
     # Logs an alert event to BigQuery.
-    # Called by Flask whenever an alert is triggered.
     row = {
         "timestamp":    now_utc(),
         "alert_type":   alert_type,
@@ -220,8 +195,7 @@ def insert_alert(alert_type, message):
     return len(errors) == 0
 
 def get_recent_alerts(limit=10):
-    # Returns the most recent alerts.
-    # Used by Streamlit dashboard.
+    # Returns the most recent alerts for the dashboard.
     sql = """
         SELECT timestamp, alert_type, message
         FROM `{}`
