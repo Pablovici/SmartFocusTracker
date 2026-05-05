@@ -1,82 +1,92 @@
-# sensor_reader.py
-# Abstraction layer for all physical sensors on the M5Stack Core2.
-# Provides a single read_all() interface to main.py, isolating
-# hardware-specific logic from the rest of the application.
+# device_a/sensor_reader.py — M5Stack Core2
+# Direct I2C drivers for SHT30 (ENV3) and SGP30 (TVOC).
+# No UIFlow libraries needed.
 
-from m5stack import *
-from m5stack_ui import *
-from uiflow import *
-import unit
-from machine import Pin
+from machine import I2C, Pin
 import time
+from config import (
+    I2C_PORT_A_SCL, I2C_PORT_A_SDA,
+    I2C_PORT_C_SCL, I2C_PORT_C_SDA,
+    PIR_PIN
+)
 
-# Sensors are initialized at module level since they map directly
-# to physical ports and only need to be instantiated once at boot.
-# Re-instantiating them on every read would be wasteful and unstable.
-env_sensor  = unit.get(unit.ENV3, unit.PORTA)  # ENVIII  → Port A (SDA=32, SCL=33)
-tvoc_sensor = unit.get(unit.TVOC, unit.PORTC)  # CO2/TVOC → Port C (SDA=13, SCL=14)
-pir_pin     = Pin(26, Pin.IN)                   # PIR      → Port B, digital input
+# ============================================================
+# SHT30 — Temperature & Humidity (ENV3, Port A)
+# ============================================================
+class SHT30:
+    def __init__(self, i2c, addr=0x44):
+        self.i2c  = i2c
+        self.addr = addr
 
+    @property
+    def temperature(self):
+        self.i2c.writeto(self.addr, bytes([0x2C, 0x06]))
+        time.sleep_ms(50)
+        data = self.i2c.readfrom(self.addr, 6)
+        return -45 + (175 * ((data[0] << 8) | data[1]) / 65535.0)
 
+    @property
+    def humidity(self):
+        self.i2c.writeto(self.addr, bytes([0x2C, 0x06]))
+        time.sleep_ms(50)
+        data = self.i2c.readfrom(self.addr, 6)
+        return 100 * ((data[3] << 8) | data[4]) / 65535.0
+
+# ============================================================
+# SGP30 — CO2 & TVOC (Port C)
+# ============================================================
+class SGP30:
+    def __init__(self, i2c, addr=0x58):
+        self.i2c  = i2c
+        self.addr = addr
+        self.i2c.writeto(self.addr, bytes([0x20, 0x03]))
+        time.sleep_ms(10)
+
+    @property
+    def eCO2(self):
+        self.i2c.writeto(self.addr, bytes([0x20, 0x08]))
+        time.sleep_ms(12)
+        data = self.i2c.readfrom(self.addr, 6)
+        return (data[0] << 8) | data[1]
+
+    @property
+    def TVOC(self):
+        self.i2c.writeto(self.addr, bytes([0x20, 0x08]))
+        time.sleep_ms(12)
+        data = self.i2c.readfrom(self.addr, 6)
+        return (data[3] << 8) | data[4]
+
+# ============================================================
+# SensorReader — interface principale pour main.py
+# ============================================================
 class SensorReader:
-    """
-    Handles all sensor reads. Returns a dict on success, None on failure.
-    Failures are caught per sensor so one bad read never crashes the loop.
-    """
-
-    def read_enviii(self):
-        # Reads temperature (°C) and humidity (%) from the ENVIII sensor.
-        # Values are rounded to 1 decimal place — raw float precision
-        # (e.g. 21.348291) is unnecessary for environmental monitoring
-        # and would waste storage in BigQuery over thousands of rows.
-        try:
-            return {
-                "temperature": round(env_sensor.temperature, 1),
-                "humidity":    round(env_sensor.humidity, 1)
-            }
-        except Exception as e:
-            print("[ENVIII] Read failed:", e)
-            return None
-
-    def read_air_quality(self):
-        # Reads eCO2 (equivalent CO2, in ppm) and TVOC (Total Volatile
-        # Organic Compounds, in ppb) from the air quality sensor.
-        # Normal indoor CO2 is ~400-1000 ppm. Above 1500 ppm impacts focus.
-        # Alert thresholds are evaluated downstream in focus_logic.py.
-        try:
-            return {
-                "co2_ppm":  tvoc_sensor.eCO2,
-                "tvoc_ppb": tvoc_sensor.TVOC
-            }
-        except Exception as e:
-            print("[TVOC] Read failed:", e)
-            return None
-
-    def read_motion(self):
-        # PIR outputs a binary digital signal: HIGH (1) = motion detected.
-        # bool() ensures a clean True/False regardless of the raw integer
-        # returned by pin.value(), which avoids type inconsistencies
-        # when serializing the payload sent to the middleware.
-        try:
-            return bool(pir_pin.value())
-        except Exception as e:
-            print("[PIR] Read failed:", e)
-            return False
+    def __init__(self):
+        i2c_a = I2C(1, scl=Pin(I2C_PORT_A_SCL), sda=Pin(I2C_PORT_A_SDA), freq=100000)
+        i2c_c = I2C(scl=Pin(I2C_PORT_C_SCL), sda=Pin(I2C_PORT_C_SDA), freq=100000)
+        self.env = SHT30(i2c_a)
+        self.tvoc = SGP30(i2c_c)
+        self.pir = Pin(PIR_PIN, Pin.IN)
 
     def read_all(self):
-        # Single entry point called by main.py every 60 seconds.
-        # Each sensor is read independently — if one fails and returns None,
-        # the others are unaffected. The conditional "if env else None"
-        # propagates the failure cleanly without raising a KeyError,
-        # allowing main.py to decide how to handle missing values.
-        env    = self.read_enviii()
-        air    = self.read_air_quality()
-        motion = self.read_motion()
-
-        return {
-            "temperature": env["temperature"] if env else None,
-            "humidity":    env["humidity"]    if env else None,
-            "co2_ppm":     air["co2_ppm"]     if air else None,
-            "tvoc_ppb":    air["tvoc_ppb"]    if air else None,
-            "motion":      motion
+        result = {
+            "temperature": None,
+            "humidity":    None,
+            "co2_ppm":     None,
+            "tvoc_ppb":    None,
+            "motion":      False
         }
+        try:
+            result["temperature"] = round(self.env.temperature, 1)
+            result["humidity"]    = round(self.env.humidity, 1)
+        except Exception as e:
+            print("[SENSOR] ENV:", e)
+        try:
+            result["co2_ppm"]  = self.tvoc.eCO2
+            result["tvoc_ppb"] = self.tvoc.TVOC
+        except Exception as e:
+            print("[SENSOR] TVOC:", e)
+        try:
+            result["motion"] = bool(self.pir.value())
+        except Exception as e:
+            print("[SENSOR] PIR:", e)
+        return result
