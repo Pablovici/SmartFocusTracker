@@ -282,13 +282,20 @@ def draw_error_screen(message, duration=4):
     """
     Briefly shows an error message (e.g., wrong card tapped),
     then restores the appropriate screen automatically.
+    Split into two lines and use DejaVu40 so the message is
+    large and clearly readable from a distance.
     """
     lcd.clear(COLOR_BG)
     _draw_header()
+    # Line 1 — big red label, vertically centred on the screen (y=85)
+    # DejaVu40 char width ≈ 26px — _cx() uses this to compute x
+    lcd.font(lcd.FONT_DejaVu40)
+    lcd.print(message, _cx(message, 26, -6), 85, COLOR_BAD)
+    # Line 2 — small grey hint below
+    hint = "Only same card can end"
     lcd.font(lcd.FONT_DejaVu18)
-    lcd.print(message, _cx(message, 11, -4), 100, COLOR_BAD)
+    lcd.print(hint, _cx(hint, 11, -4), 145, COLOR_GREY_SOFT)
     time.sleep(duration)
-    # After the error clears, return to whichever screen is appropriate
     draw_session_screen() if state["session_active"] else draw_idle_screen()
 
 def draw_wifi_screen():
