@@ -1,8 +1,8 @@
 # dashboard/app.py
 # Streamlit web dashboard for the Smart Weather + Focus Monitor.
-# Displays real-time and historical data fetched from Flask middleware.
 # Assigned to: Amir
 
+import time
 import streamlit as st
 import plotly.express as px
 from datetime import datetime
@@ -25,17 +25,14 @@ st.set_page_config(
 
 st.markdown("""
     <style>
-        /* Dark background for metric cards */
         [data-testid="metric-container"] {
             background-color: #1a1a2e;
             border: 1px solid #444;
             border-radius: 8px;
             padding: 12px;
         }
-        /* Section headers */
         h2 { color: #4fc3f7; }
         h3 { color: #aaaaaa; }
-        /* Sidebar */
         [data-testid="stSidebar"] { background-color: #0f0f1a; }
     </style>
 """, unsafe_allow_html=True)
@@ -48,14 +45,9 @@ with st.sidebar:
     st.title("⚙️ Settings")
     st.markdown("---")
 
-    # Days selector — used by all historical charts
     days = st.slider("History (days)", min_value=1, max_value=30, value=7)
 
-    # Refresh button — now correctly clears all @st.cache_data caches
-    # since all data_loader functions are properly decorated.
-    # Previously, cache_data.clear() was called but nothing was cached,
-    # making this button a visual no-op.
-    if st.button("🔄 Refresh Data"):
+    if st.button("🔄 Refresh Now"):
         st.cache_data.clear()
         st.rerun()
 
@@ -153,32 +145,23 @@ col1, col2, col3 = st.columns(3)
 with col1:
     active = session.get("active", False)
     paused = session.get("paused", False)
-
-    # FIX — previous logic showed "🟡 Paused" even when active=False.
-    # Now explicitly checks both active and paused together.
     if active and not paused:
         status = "🟢 Active"
     elif active and paused:
         status = "🟡 Paused"
     else:
         status = "⚪ No Session"
-
     st.metric(label="Status", value=status)
 
 with col2:
     work_sec = session.get("work_seconds") or 0
-    # FIX — previous code used `if work_sec` which treated 0 as falsy.
-    # Using explicit comparison so a session at exactly 0s still displays.
     if work_sec > 0:
         h = int(work_sec // 3600)
         m = int((work_sec % 3600) // 60)
         s = int(work_sec % 60)
-        if h > 0:
-            work_str = "{}h {}m".format(h, m)
-        elif m > 0:
-            work_str = "{}m {}s".format(m, s)
-        else:
-            work_str = "{}s".format(s)
+        if h > 0:   work_str = "{}h {}m".format(h, m)
+        elif m > 0: work_str = "{}m {}s".format(m, s)
+        else:       work_str = "{}s".format(s)
     else:
         work_str = "—"
     st.metric(label="Work Time", value=work_str)
@@ -202,65 +185,31 @@ st.header("📊 Indoor History")
 df_indoor = dl.get_indoor_history(days=days)
 
 if not df_indoor.empty:
-    fig_temp = px.line(
-        df_indoor,
-        x="timestamp",
-        y="temperature",
+    fig_temp = px.line(df_indoor, x="timestamp", y="temperature",
         title="Indoor Temperature (°C)",
-        color_discrete_sequence=["#4fc3f7"],
-        template="plotly_dark",
-    )
-    fig_temp.update_layout(
-        plot_bgcolor="#1a1a2e",
-        paper_bgcolor="#1a1a2e",
-        xaxis_title="",
-        yaxis_title="°C",
-    )
+        color_discrete_sequence=["#4fc3f7"], template="plotly_dark")
+    fig_temp.update_layout(plot_bgcolor="#1a1a2e", paper_bgcolor="#1a1a2e",
+        xaxis_title="", yaxis_title="°C")
     st.plotly_chart(fig_temp, use_container_width=True)
 
     col1, col2 = st.columns(2)
-
     with col1:
-        fig_hum = px.line(
-            df_indoor,
-            x="timestamp",
-            y="humidity",
+        fig_hum = px.line(df_indoor, x="timestamp", y="humidity",
             title="Humidity (%)",
-            color_discrete_sequence=["#81d4fa"],
-            template="plotly_dark",
-        )
-        fig_hum.add_hline(
-            y=40,
-            line_dash="dash",
-            line_color="orange",
-            annotation_text="Min threshold (40%)",
-        )
-        fig_hum.update_layout(
-            plot_bgcolor="#1a1a2e",
-            paper_bgcolor="#1a1a2e",
-        )
+            color_discrete_sequence=["#81d4fa"], template="plotly_dark")
+        fig_hum.add_hline(y=40, line_dash="dash", line_color="orange",
+            annotation_text="Min threshold (40%)")
+        fig_hum.update_layout(plot_bgcolor="#1a1a2e", paper_bgcolor="#1a1a2e")
         st.plotly_chart(fig_hum, use_container_width=True)
 
     with col2:
         if "co2_ppm" in df_indoor.columns:
-            fig_co2 = px.line(
-                df_indoor,
-                x="timestamp",
-                y="co2_ppm",
+            fig_co2 = px.line(df_indoor, x="timestamp", y="co2_ppm",
                 title="CO2 (ppm)",
-                color_discrete_sequence=["#a5d6a7"],
-                template="plotly_dark",
-            )
-            fig_co2.add_hline(
-                y=1000,
-                line_dash="dash",
-                line_color="red",
-                annotation_text="Poor air threshold",
-            )
-            fig_co2.update_layout(
-                plot_bgcolor="#1a1a2e",
-                paper_bgcolor="#1a1a2e",
-            )
+                color_discrete_sequence=["#a5d6a7"], template="plotly_dark")
+            fig_co2.add_hline(y=1000, line_dash="dash", line_color="red",
+                annotation_text="Poor air threshold")
+            fig_co2.update_layout(plot_bgcolor="#1a1a2e", paper_bgcolor="#1a1a2e")
             st.plotly_chart(fig_co2, use_container_width=True)
 else:
     st.info("No indoor history available for the selected period.")
@@ -276,18 +225,10 @@ st.header("🌍 Outdoor Weather History")
 df_outdoor = dl.get_outdoor_history(days=days)
 
 if not df_outdoor.empty:
-    fig_out = px.line(
-        df_outdoor,
-        x="timestamp",
-        y="temperature",
+    fig_out = px.line(df_outdoor, x="timestamp", y="temperature",
         title="Outdoor Temperature (°C)",
-        color_discrete_sequence=["#ffcc80"],
-        template="plotly_dark",
-    )
-    fig_out.update_layout(
-        plot_bgcolor="#1a1a2e",
-        paper_bgcolor="#1a1a2e",
-    )
+        color_discrete_sequence=["#ffcc80"], template="plotly_dark")
+    fig_out.update_layout(plot_bgcolor="#1a1a2e", paper_bgcolor="#1a1a2e")
     st.plotly_chart(fig_out, use_container_width=True)
 else:
     st.info("No outdoor history available for the selected period.")
@@ -304,38 +245,25 @@ df_sessions = dl.get_session_history(limit=20)
 stats       = dl.get_session_stats()
 
 col1, col2, col3, col4 = st.columns(4)
-
 with col1:
     st.metric(label="Total Sessions",  value=stats.get("total_sessions", "—"))
-
 with col2:
     avg = stats.get("avg_work_minutes")
     st.metric(label="Avg Work Time",   value="{}min".format(round(avg, 1)) if avg else "—")
-
 with col3:
     total = stats.get("total_work_minutes")
     st.metric(label="Total Work Time", value="{}min".format(round(total, 0)) if total else "—")
-
 with col4:
     longest = stats.get("longest_session_minutes")
     st.metric(label="Longest Session", value="{}min".format(round(longest, 0)) if longest else "—")
 
 if not df_sessions.empty and "total_work_minutes" in df_sessions.columns:
     df_sessions["label"] = df_sessions["start_time"].dt.strftime("%b %d %H:%M")
-    fig_sessions = px.bar(
-        df_sessions,
-        x="label",
-        y="total_work_minutes",
+    fig_sessions = px.bar(df_sessions, x="label", y="total_work_minutes",
         title="Work Sessions — Duration (minutes)",
-        color_discrete_sequence=["#ce93d8"],
-        template="plotly_dark",
-    )
-    fig_sessions.update_layout(
-        plot_bgcolor="#1a1a2e",
-        paper_bgcolor="#1a1a2e",
-        xaxis_title="Session",
-        yaxis_title="Minutes",
-    )
+        color_discrete_sequence=["#ce93d8"], template="plotly_dark")
+    fig_sessions.update_layout(plot_bgcolor="#1a1a2e", paper_bgcolor="#1a1a2e",
+        xaxis_title="Session", yaxis_title="Minutes")
     st.plotly_chart(fig_sessions, use_container_width=True)
 else:
     st.info("No completed sessions yet.")
@@ -351,10 +279,25 @@ st.header("🔔 Recent Alerts")
 df_alerts = dl.get_recent_alerts(limit=10)
 
 if not df_alerts.empty:
-    st.dataframe(
-        df_alerts[["timestamp", "alert_type", "message"]],
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(df_alerts[["timestamp", "alert_type", "message"]],
+        use_container_width=True, hide_index=True)
 else:
     st.success("No recent alerts.")
+
+# ============================================================
+# AUTO-REFRESH (FIX 3 — Streamlit)
+#
+# Without this, Streamlit only updates when the user interacts.
+# The session status and sensor data would stay frozen at the
+# last page load time regardless of what's happening on the device.
+#
+# How it works: after the page finishes rendering, the script
+# sleeps for AUTO_REFRESH_SECS seconds then calls st.rerun(),
+# which re-executes the entire script → fresh data is fetched
+# from the middleware and the page re-renders automatically.
+# ============================================================
+
+AUTO_REFRESH_SECS = 15
+
+time.sleep(AUTO_REFRESH_SECS)
+st.rerun()
