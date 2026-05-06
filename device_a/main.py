@@ -9,7 +9,7 @@ import ubinascii
 import urequests
 import ujson
 from machine import I2C, Pin
-from m5stack import lcd, btnA, btnB, btnC, speaker
+from m5stack import lcd, btnA, btnB, btnC, speaker, rgb
 from MediaTrans.MicRecord import MicRecord
 
 # ============================================================
@@ -18,13 +18,15 @@ from MediaTrans.MicRecord import MicRecord
 MIDDLEWARE_URL   = "https://smartfocustracker-middleware-1054003632036.europe-west6.run.app"
 CLOUD_HOST       = "smartfocustracker-middleware-1054003632036.europe-west6.run.app"
 CLOUD_PORT       = 443
-NTP_UTC_OFFSET   = 2
-SENSOR_INTERVAL  = 30
+NTP_UTC_OFFSET   = 2          # UTC+2 CEST (Lausanne, mars-oct) / UTC+1 CET (nov-fév)
+SENSOR_INTERVAL  = 10        # lecture capteurs toutes les 10s
+BQ_INTERVAL      = 20        # envoi BigQuery toutes les 20s
 DRAW_INTERVAL    = 5
 HUMIDITY_MIN     = 40
-WEATHER_INTERVAL = 600
+WEATHER_INTERVAL = 1800       # 30 min entre fetch météo
 ALERT_COOLDOWN   = 3600
 BREAK_INTERVAL   = 3600
+PIR_ABSENT_ALERT = 300        # 5 min sans mouvement → alerte
 RECORD_SECS      = 5
 VOICE_FILE       = '/flash/voice.wav'
 RESP_FILE        = '/flash/res/resp.wav'
@@ -45,6 +47,10 @@ COLOR_GOOD    = 0x00FF00
 COLOR_WARN    = 0xFFAA00
 COLOR_BAD     = 0xFF0000
 COLOR_ACCENT  = 0x00BCD4
+
+COLOR_GREY_DIM      = 0x555577
+COLOR_CARD_ACTIVE   = 0x0d2b1a
+COLOR_CARD_INACTIVE = 0x22223a
 
 COLOR_SUN   = 0xFFD740
 COLOR_RAIN  = 0x4FC3F7
@@ -126,11 +132,11 @@ state = {
     "session_active": False, "session_paused": False, "session_work_sec": 0,
     "time_str": "--:--", "date_str": "---",
 }
-alert_times    = {"weather": 0, "humidity": 0, "air": 0, "break": 0}
-current_screen = 0
+alert_times      = {"weather": 0, "humidity": 0, "air": 0, "break": 0, "absent": 0}
+last_motion_time = 0
+current_screen   = 0
 last_answer    = ""
 last_question  = ""
-wifi_sel_idx   = 0
 
 # ============================================================
 # HELPERS
@@ -383,6 +389,29 @@ def fetch_session():
     except Exception as e: print("[SESSION]", e)
     gc.collect()
 
+def sync_latest():
+    # Restores last known sensor values from BigQuery on boot.
+    # Ensures the display shows meaningful data immediately,
+    # even before the live sensor cycle runs.
+    try:
+        r = urequests.get(MIDDLEWARE_URL + "/latest")
+        if r.status_code == 200:
+            d = ujson.loads(r.text)
+            if d.get("temperature") is not None:
+                state["temperature"] = round(d["temperature"], 1)
+            if d.get("humidity") is not None:
+                state["humidity"] = round(d["humidity"], 1)
+            if d.get("co2_ppm") is not None:
+                state["co2_ppm"] = d["co2_ppm"]
+            if d.get("tvoc_ppb") is not None:
+                state["tvoc_ppb"] = d["tvoc_ppb"]
+            if d.get("air_quality_label"):
+                state["air_quality_label"] = d["air_quality_label"]
+            state["motion"] = bool(d.get("motion_detected", False))
+        r.close()
+    except Exception as e: print("[SYNC]", e)
+    gc.collect()
+
 # ============================================================
 # HTTPS SOCKET — stream WAV to /ask
 # ============================================================
@@ -554,6 +583,13 @@ def speak(text):
     except Exception as e: print("[TTS]", e)
     gc.collect()
 
+def update_leds():
+    label = state["air_quality_label"]
+    if label == "Good":     rgb.setColorAll(0x00CC00)
+    elif label == "Moderate": rgb.setColorAll(0xFFAA00)
+    elif label == "Poor":   rgb.setColorAll(0xFF0000)
+    else:                   rgb.setColorAll(0x000000)
+
 def check_alerts():
     if not state["motion"]: return
     now = time.time()
@@ -575,6 +611,10 @@ def check_alerts():
             if now - alert_times["break"] > ALERT_COOLDOWN:
                 speak("Time for a break!")
                 alert_times["break"] = now
+        if last_motion_time > 0 and now - last_motion_time > PIR_ABSENT_ALERT:
+            if now - alert_times["absent"] > PIR_ABSENT_ALERT:
+                speak("Are you still there? No movement detected for 5 minutes.")
+                alert_times["absent"] = now
 
 # ============================================================
 # DISPLAY — MAIN (screen 0)
@@ -654,11 +694,12 @@ def draw_forecast_screen():
         return
 
     td    = today_str()
-    y0    = 30    # first row top
-    row_h = 38    # 5 rows × 38 = 190px  +  header 30  +  footer 20  = 240 ✓
+    col_w = 64   # 5 columns x 64px = 320px
 
     for i, day in enumerate(forecast[:5]):
-        y    = y0 + i * row_h
+        cx   = col_w * i + 32   # column center x: 32, 96, 160, 224, 288
+        x0   = col_w * i        # column left edge
+
         date = day.get("date", "")
         name = date_to_dayname(date, td)
         tmin = int(round(day.get("temp_min", 0)))
@@ -666,31 +707,78 @@ def draw_forecast_screen():
         cond = day.get("condition", "N/A")
         col  = condition_color(cond)
 
-        # Left color strip
-        lcd.fillRect(0, y + 1, 4, row_h - 2, col)
+        # Vertical separator (skip first column)
+        if i > 0:
+            lcd.line(x0, 29, x0, 205, COLOR_DIVIDER)
 
-        # Day name (max 5 chars, FONT_DejaVu18)
-        lcd.font(lcd.FONT_DejaVu18)
-        name_disp = name[:5] if len(name) > 5 else name
-        lcd.print(name_disp, 8, y + 10, COLOR_WHITE)
+        # Top color accent bar
+        x_bar = x0 + (1 if i > 0 else 0)
+        lcd.fillRect(x_bar, 29, col_w - (1 if i > 0 else 0), 5, col)
 
-        # Weather icon centered at x=80, vertically centered in row
-        draw_weather_icon(80, y + row_h // 2, cond)
-
-        # Temperature range — line 1
+        # Day name (3 chars, centered)
         lcd.font(lcd.FONT_Default)
-        lcd.print("{}~{}C".format(tmin, tmax), 100, y + 9, col)
+        name_s = name[:3]
+        lcd.print(name_s, cx - len(name_s) * 4, 42, col)
 
-        # Condition text — line 2 (max 20 chars)
-        cond_disp = cond[:20] if len(cond) > 20 else cond
-        lcd.print(cond_disp, 100, y + 22, COLOR_GREY)
+        # Weather icon centered in column
+        draw_weather_icon(cx, 88, cond)
 
-        # Row separator (skip after last)
-        if i < 4:
-            lcd.line(4, y + row_h, 320, y + row_h, COLOR_DIVIDER)
+        # Max temperature (larger font)
+        lcd.font(lcd.FONT_DejaVu18)
+        tmax_s = "{}°".format(tmax)
+        lcd.print(tmax_s, cx - len(tmax_s) * 6, 130, COLOR_WHITE)
 
+        # Min temperature (smaller font, grey)
+        lcd.font(lcd.FONT_Default)
+        tmin_s = "{}°".format(tmin)
+        lcd.print(tmin_s, cx - len(tmin_s) * 4, 155, COLOR_GREY)
+
+        # Condition first word (max 7 chars)
+        cond_s = cond.split()[0][:7]
+        lcd.print(cond_s, cx - len(cond_s) * 4, 172, COLOR_GREY)
+
+    lcd.line(0, 205, 320, 205, COLOR_DIVIDER)
     lcd.font(lcd.FONT_Default)
-    lcd.print("[Back]", 10, 220, COLOR_GREY)
+    lcd.print("[Back]", 10, 215, COLOR_GREY)
+
+# ============================================================
+# DISPLAY — WIFI (screen 4) — helpers
+# ============================================================
+def _wifi_cx(text, char_w):
+    return max(0, (320 - len(text) * char_w) // 2)
+
+def _wifi_rx(text, char_w, margin=10):
+    return max(0, 320 - len(text) * char_w - margin)
+
+def _wifi_split(ssid, max_chars=11):
+    if len(ssid) <= max_chars:
+        return [ssid, ""]
+    idx = ssid.rfind(" ", 0, max_chars)
+    if idx > 0:
+        return [ssid[:idx], ssid[idx + 1:]]
+    return [ssid[:max_chars], ssid[max_chars:]]
+
+def _wifi_draw_card(x, y, w, h, ssid):
+    try:    is_active = wlan.isconnected() and wlan.config("essid") == ssid
+    except: is_active = False
+    bg = COLOR_CARD_ACTIVE if is_active else COLOR_CARD_INACTIVE
+    lcd.fillRect(x, y, w, h, bg)
+    top_color = COLOR_GOOD if is_active else COLOR_DIVIDER
+    lcd.line(x,     y,     x + w, y,     top_color)
+    lcd.line(x,     y,     x,     y + h, COLOR_DIVIDER)
+    lcd.line(x + w, y,     x + w, y + h, COLOR_DIVIDER)
+    lcd.line(x,     y + h, x + w, y + h, COLOR_DIVIDER)
+    lines      = _wifi_split(ssid, 11)
+    name_color = COLOR_WHITE if is_active else COLOR_GREY
+    lcd.font(lcd.FONT_DejaVu18)
+    lcd.print(lines[0], x + 7, y + 10, name_color)
+    if lines[1]:
+        lcd.print(lines[1], x + 7, y + 30, name_color)
+    if is_active:
+        lcd.print(">> Active", x + 7, y + 72, COLOR_GOOD)
+    else:
+        lcd.print("Tap to",   x + 7, y + 68, COLOR_GREY_DIM)
+        lcd.print("connect",  x + 7, y + 88, COLOR_GREY_DIM)
 
 # ============================================================
 # DISPLAY — WIFI (screen 4)
@@ -698,32 +786,16 @@ def draw_forecast_screen():
 def draw_wifi_screen():
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
-    lcd.print("WiFi", 10, 8, COLOR_WHITE)
-    if wlan.isconnected():
-        ssid = wlan.config("essid")
-        ip   = wlan.ifconfig()[0]
-        lcd.print("Connected", 150, 8, COLOR_GOOD)
-        lcd.font(lcd.FONT_Default)
-        lcd.print("SSID: {}".format(ssid), 10, 34, COLOR_GREY)
-        lcd.print("IP:   {}".format(ip),   10, 48, COLOR_GREY)
-    else:
-        lcd.print("Disconnected", 130, 8, COLOR_BAD)
-    lcd.line(0, 65, 320, 65, COLOR_DIVIDER)
+    title = "WiFi Selection"
+    lcd.print(title, _wifi_cx(title, 11), 8, COLOR_ACCENT)
+    lcd.line(0, 30, 320, 30, COLOR_DIVIDER)
+    _wifi_draw_card(6,   40, 146, 138, KNOWN_NETWORKS[0][0])
+    _wifi_draw_card(168, 40, 146, 138, KNOWN_NETWORKS[1][0])
+    lcd.line(0, 188, 320, 188, COLOR_DIVIDER)
     lcd.font(lcd.FONT_DejaVu18)
-    lcd.print("Select network:", 10, 72, COLOR_GREY)
-    y = 100
-    for i, (ssid, _) in enumerate(KNOWN_NETWORKS):
-        if i == wifi_sel_idx:
-            lcd.print(">", 10, y, COLOR_ACCENT)
-            lcd.print(ssid[:28], 28, y, COLOR_WHITE)
-        else:
-            lcd.print(" ", 10, y, COLOR_GREY)
-            lcd.print(ssid[:28], 28, y, COLOR_GREY)
-        y += 32
-    lcd.font(lcd.FONT_Default)
-    lcd.print("[Back]",    10,  220, COLOR_GREY)
-    lcd.print("[Connect]", 110, 220, COLOR_GOOD)
-    lcd.print("[Next]",    250, 220, COLOR_ACCENT)
+    lcd.print("< Connect", 10,                         205, COLOR_ACCENT)
+    lcd.print("Cancel",    _wifi_cx("Cancel", 11),     205, COLOR_GREY)
+    lcd.print("Connect >", _wifi_rx("Connect >", 11),  205, COLOR_ACCENT)
 
 # ============================================================
 # BUTTONS
@@ -733,18 +805,13 @@ def handle_buttons():
 
     if current_screen == 4:        # WiFi
         if btnA.wasPressed():
+            connect_to_network(0)
             current_screen = 0
         if btnB.wasPressed():
-            ok = connect_to_network(wifi_sel_idx)
-            draw_wifi_screen()
-            lcd.font(lcd.FONT_DejaVu18)
-            lcd.print("Connected!" if ok else "Failed!", 80, 140,
-                      COLOR_GOOD if ok else COLOR_BAD)
-            time.sleep(1)
-            draw_wifi_screen()
+            current_screen = 0
         if btnC.wasPressed():
-            wifi_sel_idx = (wifi_sel_idx + 1) % len(KNOWN_NETWORKS)
-            draw_wifi_screen()
+            connect_to_network(1)
+            current_screen = 0
 
     elif current_screen == 3:      # Forecast
         if btnA.wasPressed():
@@ -773,12 +840,21 @@ def boot():
     show_msg("Warming up\nair sensor...")
     time.sleep(15)
     connect_wifi()
-    try: ntptime.settime()
-    except: pass
+    # NTP sync with 3 retries — silent fail is worse than slow boot
+    for _ntp in range(3):
+        try:
+            ntptime.settime()
+            print("[NTP] Sync OK")
+            break
+        except Exception as e:
+            print("[NTP] Attempt", _ntp + 1, "failed:", e)
+            time.sleep(2)
+    sync_latest()
     fetch_weather()
     fetch_session()
     state["time_str"], state["date_str"] = get_time_strings()
     read_sensors()
+    update_leds()
     draw_main_screen()
     print("[BOOT] Done.")
 
@@ -786,15 +862,28 @@ def boot():
 # MAIN LOOP
 # ============================================================
 def loop():
-    last_sensor = 0; last_weather = 0; last_session = 0
-    last_clock  = 0; last_draw    = 0
+    global last_motion_time
+    last_sensor = 0; last_bq      = 0; last_weather = 0
+    last_session= 0; last_clock  = 0; last_draw    = 0; last_ntp = 0
     while True:
         now = time.time()
         if now - last_clock >= 1:
             state["time_str"], state["date_str"] = get_time_strings()
             last_clock = now
+        try:
+            state["motion"] = bool(pir.value())
+            if state["motion"]:
+                last_motion_time = now
+        except: pass
+        # Re-sync NTP every hour to stay accurate
+        if now - last_ntp >= 3600:
+            try: ntptime.settime()
+            except: pass
+            last_ntp = now
         if now - last_sensor >= SENSOR_INTERVAL:
-            read_sensors(); post_indoor(); last_sensor = now
+            read_sensors(); update_leds(); last_sensor = now
+        if now - last_bq >= BQ_INTERVAL:
+            post_indoor(); last_bq = now
         if now - last_weather >= WEATHER_INTERVAL:
             fetch_weather(); last_weather = now
         if now - last_session >= 5:
