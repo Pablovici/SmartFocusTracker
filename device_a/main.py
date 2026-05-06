@@ -175,6 +175,14 @@ _last_main = {
 # on first boot, and every time we switch back to screen 0.
 _main_needs_full_redraw = True
 
+# Forecast screen is only redrawn when data changes (every 30 min)
+# or when first entering the screen. Without this flag, draw_forecast_screen()
+# was called every DRAW_INTERVAL (5s) causing unnecessary full redraws.
+_forecast_needs_redraw = True
+
+# WiFi screen is only redrawn on first entry or after a connection attempt.
+_wifi_needs_redraw = True
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -406,7 +414,10 @@ def fetch_weather():
     """
     gc.collect() before the call prevents MicroPython heap
     fragmentation from causing MemoryError on long runtimes.
+    Sets _forecast_needs_redraw so the forecast screen repaints
+    only when data actually changed, not every 5 seconds.
     """
+    global _forecast_needs_redraw
     gc.collect()
     try:
         r = urequests.get(MIDDLEWARE_URL + "/weather")
@@ -417,6 +428,7 @@ def fetch_weather():
             state["weather_cond"] = current.get("condition", "N/A")
             state["weather_city"] = current.get("city", "")
             state["forecast"]     = data.get("forecast", [])
+            _forecast_needs_redraw = True   # New data arrived — redraw forecast if visible
         r.close()
     except Exception as e: print("[WEATHER]", e)
     gc.collect()
@@ -884,8 +896,10 @@ def handle_buttons():
     FIX 1 — sets _main_needs_full_redraw = True whenever returning
     to screen 0 from another screen, so the next draw cycle does a
     full lcd.clear() + redraw instead of a partial update on a stale bg.
+    Sets _forecast_needs_redraw and _wifi_needs_redraw when entering
+    those screens so they draw exactly once on entry, not every 5s.
     """
-    global current_screen, _main_needs_full_redraw
+    global current_screen, _main_needs_full_redraw, _forecast_needs_redraw, _wifi_needs_redraw
 
     if current_screen == 4:
         if btnA.wasPressed():
@@ -913,13 +927,13 @@ def handle_buttons():
     else:
         if btnA.wasPressed():
             current_screen = 4
-            draw_wifi_screen()
+            _wifi_needs_redraw = True       # Draw WiFi screen once on entry
         if btnB.wasPressed():
             voice_flow()
-            _main_needs_full_redraw = True   # voice_flow() may have overwritten screen
+            _main_needs_full_redraw = True
         if btnC.wasPressed():
             current_screen = 3
-            draw_forecast_screen()
+            _forecast_needs_redraw = True   # Draw forecast once on entry
 
 # ============================================================
 # BOOT
@@ -1007,9 +1021,18 @@ def loop():
                     # Partial update — only changed zones repainted
                     smart_update_main_screen()
             elif current_screen == 3:
-                draw_forecast_screen()
+                # Forecast: only redraw when data changed or first entry
+                # (data changes every 30 min via fetch_weather)
+                # Without this flag, draw_forecast_screen() was called
+                # every DRAW_INTERVAL causing a full screen flash.
+                if _forecast_needs_redraw:
+                    draw_forecast_screen()
+                    _forecast_needs_redraw = False
             elif current_screen == 4:
-                draw_wifi_screen()
+                # WiFi: only redraw on first entry or after connection attempt
+                if _wifi_needs_redraw:
+                    draw_wifi_screen()
+                    _wifi_needs_redraw = False
             last_draw = now
 
         gc.collect()
