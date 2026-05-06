@@ -4,22 +4,32 @@
 # Google Cloud service account
 gcp_service_account.json
 
+# Streamlit secrets only — config.toml should be committed
+dashboard/.streamlit/secrets.toml
+
 # Python virtual environments
 .venv/
 venv/
 env/
 
-# Python cache
+# Python cache and build artifacts
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+dist/
+build/
+
+# Test cache
+.pytest_cache/
+
+# Logs
+*.log
 
 # IDE
 .vscode/
 .idea/
 
-# macOS system files
+# OS files
 .DS_Store
-
-# Streamlit cache
-.streamlit/
+Thumbs.db
