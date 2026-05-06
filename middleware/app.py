@@ -2,11 +2,13 @@
 # Flask API — main entry point for the middleware layer.
 # Receives data from M5Stack devices and serves data to Streamlit dashboard.
 # All BigQuery operations are delegated to bigquery_client.py.
+# Assigned to: Pablo
 
 import os
 import uuid
 import json
 import time
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -51,13 +53,15 @@ _session = {
 # HELPERS
 # ============================================================
 
+def _unix_to_iso(ts):
+    """Converts a Unix float timestamp to a UTC ISO 8601 string."""
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
 def _compute_work_seconds():
     """
     Computes real-time elapsed work seconds for the active session.
     Subtracts all completed pauses and the ongoing pause (if any).
-
-    Returns the accumulated value even when paused — so Streamlit
-    and device boot sync always see the correct elapsed time, not 0.
+    Returns the accumulated value even when paused — not 0.
     """
     if not _session["active"] or not _session["work_start"]:
         return 0
@@ -67,7 +71,6 @@ def _compute_work_seconds():
     total_pause = sum(p["duration_sec"] for p in _session["pauses"])
 
     if _session["paused"] and _session["pause_start"]:
-        # Add the duration of the current (ongoing) pause
         total_pause += now - _session["pause_start"]
 
     return max(0, elapsed - total_pause)
@@ -133,14 +136,9 @@ def weather():
 def session_start():
     """
     Starts a new work session.
-
-    A UUID is generated here and held in memory — no BigQuery write
-    at session start. The full record is written at session end via
-    save_complete_session(). This avoids the streaming buffer UPDATE
-    limitation (rows can't be updated for ~90 minutes after insert).
-
-    card_id is stored in _session so /session/current can return it
-    for Device B boot sync (needed to restore active_card_id).
+    A UUID is generated and held in memory — no BigQuery write at session start.
+    The full record is written at session end via save_complete_session().
+    card_id is stored so /session/current can return it for device boot sync.
     """
     data    = request.get_json()
     card_id = data.get("card_id") if data else None
@@ -167,7 +165,7 @@ def session_start():
 def session_pause():
     """
     Pauses the active session.
-    Records pause_start timestamp so duration can be computed at resume or end.
+    Records pause_start as a Unix timestamp for duration computation.
     """
     if not _session["active"] or _session["paused"]:
         return jsonify({"error": "No active session to pause"}), 400
@@ -181,8 +179,10 @@ def session_pause():
 def session_resume():
     """
     Resumes a paused session.
-    Computes the completed pause duration and appends it to _session["pauses"]
-    so it is subtracted from total work time at session end.
+    Appends the completed pause to _session["pauses"] with:
+    - pause_start / pause_end as human-readable ISO strings
+    - duration_sec rounded to 1 decimal place
+    The rounded float is still used for sum() in session_end().
     """
     if not _session["active"] or not _session["paused"]:
         return jsonify({"error": "Session is not paused"}), 400
@@ -191,9 +191,9 @@ def session_resume():
     pause_duration = pause_end - _session["pause_start"]
 
     _session["pauses"].append({
-        "pause_start":  _session["pause_start"],
-        "pause_end":    pause_end,
-        "duration_sec": pause_duration,
+        "pause_start":  _unix_to_iso(_session["pause_start"]),
+        "pause_end":    _unix_to_iso(pause_end),
+        "duration_sec": round(pause_duration, 1),
     })
     _session["paused"]      = False
     _session["pause_start"] = None
@@ -204,14 +204,10 @@ def session_resume():
 def session_end():
     """
     Ends the active session and writes the complete record to BigQuery.
-
     Calls bq.save_complete_session() — the only correct function for this.
-    The previous version called bq.end_session() which does not exist,
-    causing a 500 on every session end and writing nothing to BigQuery.
-
     Work time = total elapsed - sum of all pause durations.
-    If the session was ended while paused, the current pause is closed first.
-    After writing to BigQuery, _session is fully reset to clean defaults.
+    If ended while paused, the current pause is closed first (with ISO timestamps).
+    _session is fully reset after the BigQuery write.
     """
     if not _session["active"]:
         return jsonify({"error": "No active session"}), 400
@@ -222,9 +218,9 @@ def session_end():
     if _session["paused"] and _session["pause_start"]:
         pause_duration = end_time - _session["pause_start"]
         _session["pauses"].append({
-            "pause_start":  _session["pause_start"],
-            "pause_end":    end_time,
-            "duration_sec": pause_duration,
+            "pause_start":  _unix_to_iso(_session["pause_start"]),
+            "pause_end":    _unix_to_iso(end_time),
+            "duration_sec": round(pause_duration, 1),
         })
 
     # Compute actual work time (elapsed minus all pauses)
@@ -232,10 +228,9 @@ def session_end():
     total_pause  = sum(p["duration_sec"] for p in _session["pauses"])
     work_minutes = round((elapsed - total_pause) / 60, 2)
 
-    # Convert Unix timestamps to ISO 8601 strings for BigQuery TIMESTAMP columns
-    from datetime import datetime, timezone
-    start_iso = datetime.fromtimestamp(_session["work_start"], tz=timezone.utc).isoformat()
-    end_iso   = datetime.fromtimestamp(end_time,               tz=timezone.utc).isoformat()
+    # Convert Unix timestamps to ISO strings for BigQuery TIMESTAMP columns
+    start_iso = _unix_to_iso(_session["work_start"])
+    end_iso   = _unix_to_iso(end_time)
 
     # Write the complete session record to BigQuery in one atomic insert
     success = bq.save_complete_session(
@@ -269,12 +264,8 @@ def session_end():
 def session_current():
     """
     Returns real-time session state for M5Stack devices and Streamlit.
-
-    card_id is included so Device B can restore active_card_id after
-    a reboot — without it, any RFID tap would trigger "Wrong card".
-
-    work_seconds is computed live by _compute_work_seconds() which
-    returns the correct accumulated value even when paused, not 0.
+    card_id included for Device B boot sync (restores active_card_id).
+    work_seconds computed live — correct even when paused.
     """
     return jsonify({
         "active":       _session["active"],
@@ -291,7 +282,6 @@ def session_current():
 @app.route("/speak-wav", methods=["POST"])
 def speak_wav():
     # Returns raw LINEAR16 WAV bytes streamed directly to M5Stack flash.
-    # Allows speaker.playWAV() without base64 decoding in device RAM.
     data = request.get_json()
     text = data.get("text") if data else None
     if not text:
@@ -308,8 +298,7 @@ def speak_wav():
 
 @app.route("/speak", methods=["POST"])
 def speak():
-    # Converts text to speech via Google TTS.
-    # Logs an alert to BigQuery if the message contains alert keywords.
+    # Converts text to speech. Logs alert to BigQuery if keywords present.
     data = request.get_json()
     text = data.get("text") if data else None
     if not text:
@@ -329,9 +318,7 @@ def speak():
 
 @app.route("/llm", methods=["POST"])
 def llm():
-    # Text-only LLM endpoint.
-    # Accepts an optional "context" field with sensor data from the device
-    # so llm_service can answer data-aware questions without hitting BigQuery.
+    # Text-only LLM endpoint with optional sensor context.
     data     = request.get_json()
     question = data.get("question") if data else None
     context  = data.get("context")  if data else None
@@ -348,7 +335,6 @@ def llm():
 @app.route("/ask", methods=["POST"])
 def ask():
     # Full STT → LLM → TTS pipeline.
-    # Accepts base64-encoded audio, returns transcription + answer + audio.
     data      = request.get_json()
     audio_b64 = data.get("audio_b64") if data else None
     if not audio_b64:
@@ -373,30 +359,25 @@ def ask():
 
 @app.route("/history/indoor", methods=["GET"])
 def history_indoor():
-    # Returns indoor readings for the last N days (default 7).
     days = request.args.get("days", 7, type=int)
     return jsonify(bq.get_indoor_history(days)), 200
 
 @app.route("/history/outdoor", methods=["GET"])
 def history_outdoor():
-    # Returns outdoor weather history for the last N days (default 7).
     days = request.args.get("days", 7, type=int)
     return jsonify(bq.get_outdoor_history(days)), 200
 
 @app.route("/history/sessions", methods=["GET"])
 def history_sessions():
-    # Returns the last N completed sessions (default 20).
     limit = request.args.get("limit", 20, type=int)
     return jsonify(bq.get_session_history(limit)), 200
 
 @app.route("/history/session-stats", methods=["GET"])
 def session_stats():
-    # Returns aggregate session statistics for the Streamlit dashboard.
     return jsonify(bq.get_session_stats()), 200
 
 @app.route("/history/alerts", methods=["GET"])
 def history_alerts():
-    # Returns the most recent N alerts (default 10).
     limit = request.args.get("limit", 10, type=int)
     return jsonify(bq.get_recent_alerts(limit)), 200
 
