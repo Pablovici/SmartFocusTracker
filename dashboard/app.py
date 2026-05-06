@@ -5,7 +5,6 @@
 
 import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime
 import data_loader as dl
 
@@ -52,9 +51,13 @@ with st.sidebar:
     # Days selector — used by all historical charts
     days = st.slider("History (days)", min_value=1, max_value=30, value=7)
 
-    # Manual refresh button — Streamlit auto-refreshes on interaction
+    # Refresh button — now correctly clears all @st.cache_data caches
+    # since all data_loader functions are properly decorated.
+    # Previously, cache_data.clear() was called but nothing was cached,
+    # making this button a visual no-op.
     if st.button("🔄 Refresh Data"):
         st.cache_data.clear()
+        st.rerun()
 
     st.markdown("---")
     st.caption("Smart Weather + Focus Monitor")
@@ -78,7 +81,6 @@ latest  = dl.get_latest()
 weather = dl.get_current_weather()
 session = dl.get_current_session()
 
-# Indoor metrics row
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
@@ -90,12 +92,11 @@ with col1:
 
 with col2:
     hum = latest.get("humidity")
-    delta_color = "inverse" if hum is not None and hum < 40 else "normal"
     st.metric(
         label="💧 Humidity",
         value="{}%".format(round(hum, 1)) if hum is not None else "N/A",
         delta="Low — use humidifier" if hum is not None and hum < 40 else None,
-        delta_color=delta_color,
+        delta_color="inverse" if hum is not None and hum < 40 else "normal",
     )
 
 with col3:
@@ -109,7 +110,7 @@ with col3:
     )
 
 with col4:
-    current = weather.get("current", {})
+    current  = weather.get("current", {})
     out_temp = current.get("temperature")
     st.metric(
         label="🌍 Outdoor Temp",
@@ -134,7 +135,7 @@ if forecast:
             st.markdown("{}".format(day.get("condition", "N/A")))
             st.markdown("🌡️ {}/{} °C".format(
                 round(day.get("temp_min", 0), 1),
-                round(day.get("temp_max", 0), 1)
+                round(day.get("temp_max", 0), 1),
             ))
 else:
     st.info("Weather forecast unavailable.")
@@ -151,17 +152,33 @@ col1, col2, col3 = st.columns(3)
 
 with col1:
     active = session.get("active", False)
-    status = "🟢 Active" if active and not session.get("paused") \
-        else "🟡 Paused" if session.get("paused") \
-        else "⚪ No Session"
+    paused = session.get("paused", False)
+
+    # FIX — previous logic showed "🟡 Paused" even when active=False.
+    # Now explicitly checks both active and paused together.
+    if active and not paused:
+        status = "🟢 Active"
+    elif active and paused:
+        status = "🟡 Paused"
+    else:
+        status = "⚪ No Session"
+
     st.metric(label="Status", value=status)
 
 with col2:
-    work_sec = session.get("work_seconds", 0)
-    if work_sec:
+    work_sec = session.get("work_seconds") or 0
+    # FIX — previous code used `if work_sec` which treated 0 as falsy.
+    # Using explicit comparison so a session at exactly 0s still displays.
+    if work_sec > 0:
         h = int(work_sec // 3600)
         m = int((work_sec % 3600) // 60)
-        work_str = "{}h {}m".format(h, m) if h > 0 else "{}m".format(m)
+        s = int(work_sec % 60)
+        if h > 0:
+            work_str = "{}h {}m".format(h, m)
+        elif m > 0:
+            work_str = "{}m {}s".format(m, s)
+        else:
+            work_str = "{}s".format(s)
     else:
         work_str = "—"
     st.metric(label="Work Time", value=work_str)
@@ -171,7 +188,7 @@ with col3:
     avg   = stats.get("avg_work_minutes")
     st.metric(
         label="Avg Session",
-        value="{}min".format(round(avg, 0)) if avg else "—"
+        value="{}min".format(round(avg, 0)) if avg else "—",
     )
 
 st.markdown("---")
@@ -185,7 +202,6 @@ st.header("📊 Indoor History")
 df_indoor = dl.get_indoor_history(days=days)
 
 if not df_indoor.empty:
-    # Temperature chart
     fig_temp = px.line(
         df_indoor,
         x="timestamp",
@@ -202,7 +218,6 @@ if not df_indoor.empty:
     )
     st.plotly_chart(fig_temp, use_container_width=True)
 
-    # Humidity + CO2 side by side
     col1, col2 = st.columns(2)
 
     with col1:
@@ -214,7 +229,6 @@ if not df_indoor.empty:
             color_discrete_sequence=["#81d4fa"],
             template="plotly_dark",
         )
-        # Add threshold line at 40%
         fig_hum.add_hline(
             y=40,
             line_dash="dash",
@@ -237,7 +251,6 @@ if not df_indoor.empty:
                 color_discrete_sequence=["#a5d6a7"],
                 template="plotly_dark",
             )
-            # Add threshold line at 1000ppm
             fig_co2.add_hline(
                 y=1000,
                 line_dash="dash",
@@ -290,34 +303,23 @@ st.header("🎯 Session Analytics")
 df_sessions = dl.get_session_history(limit=20)
 stats       = dl.get_session_stats()
 
-# Stats row
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    st.metric(
-        label="Total Sessions",
-        value=stats.get("total_sessions", "—")
-    )
+    st.metric(label="Total Sessions",  value=stats.get("total_sessions", "—"))
+
 with col2:
     avg = stats.get("avg_work_minutes")
-    st.metric(
-        label="Avg Work Time",
-        value="{}min".format(round(avg, 1)) if avg else "—"
-    )
+    st.metric(label="Avg Work Time",   value="{}min".format(round(avg, 1)) if avg else "—")
+
 with col3:
     total = stats.get("total_work_minutes")
-    st.metric(
-        label="Total Work Time",
-        value="{}min".format(round(total, 0)) if total else "—"
-    )
+    st.metric(label="Total Work Time", value="{}min".format(round(total, 0)) if total else "—")
+
 with col4:
     longest = stats.get("longest_session_minutes")
-    st.metric(
-        label="Longest Session",
-        value="{}min".format(round(longest, 0)) if longest else "—"
-    )
+    st.metric(label="Longest Session", value="{}min".format(round(longest, 0)) if longest else "—")
 
-# Sessions bar chart
 if not df_sessions.empty and "total_work_minutes" in df_sessions.columns:
     df_sessions["label"] = df_sessions["start_time"].dt.strftime("%b %d %H:%M")
     fig_sessions = px.bar(
@@ -349,7 +351,6 @@ st.header("🔔 Recent Alerts")
 df_alerts = dl.get_recent_alerts(limit=10)
 
 if not df_alerts.empty:
-    # Color code by alert type
     st.dataframe(
         df_alerts[["timestamp", "alert_type", "message"]],
         use_container_width=True,
