@@ -4,9 +4,6 @@
 # Google Cloud service account
 gcp_service_account.json
 
-#Wifi credentials
-wifi_networks.json
-
 # Python virtual environments
 .venv/
 venv/
