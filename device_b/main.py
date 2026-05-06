@@ -26,8 +26,11 @@ BTN_DEBOUNCE_MS = 500     # Minimum ms between button events
 # How many consecutive active=False server responses required before
 # Device B trusts the server and resets its local session state.
 # A single bad response (server overloaded, partial response, brief restart)
-# is ignored. Three in a row means the session is genuinely over.
-SESSION_FALSE_THRESHOLD = 3
+# is ignored. Six in a row means the session is genuinely over.
+# For PAUSED sessions, double this threshold — a paused session should
+# only end via RFID tap, not from server polling noise.
+SESSION_FALSE_THRESHOLD        = 6
+SESSION_FALSE_THRESHOLD_PAUSED = 12
 
 # ============================================================
 # DISPLAY CONSTANTS
@@ -490,23 +493,19 @@ def fetch_session(boot_sync=False):
     """
     GETs /session/current from middleware.
 
-    KEY FIX — session_false_count guard:
-    When the server returns active=False while Device B has an active
-    session, we do NOT immediately reset. We increment a counter and
-    only reset when the counter reaches SESSION_FALSE_THRESHOLD (3).
+    session_false_count guard: requires multiple consecutive active=False
+    before resetting the session. The threshold is DOUBLED for paused
+    sessions — a paused session should only end via RFID badge tap, not
+    from server polling noise or a Cloud Run container restart.
 
-    Why: Device A polls every 5s and sometimes causes Flask to be
-    briefly busy (weather fetch, BigQuery write, TTS call). During
-    that window, Device B can receive a corrupted/partial response
-    that parses as active=False. This guard absorbs those single
-    bad responses without affecting the user experience.
+    Normal:  SESSION_FALSE_THRESHOLD        (6)  × 10s = 60s protection
+    Paused:  SESSION_FALSE_THRESHOLD_PAUSED (12) × 10s = 120s protection
 
-    When the server confirms active=True, the counter resets to 0
-    immediately and the session_start_ms guard is refreshed.
-
-    Standard cooldown guards also apply:
-    - session_end_ms:   ignore active=True for 15s after local end
-    - session_start_ms: ignore active=False for 15s after local start
+    BUG FIX — boot_sync now sets session_start_ms:
+    Previously session_start_ms was left at 0 after boot sync.
+    time.ticks_diff(now_ms, 0) is always > 15000ms on a running device,
+    so the 15s cooldown guard expired immediately and offered no protection
+    after reboot. Now it's set to ticks_ms() when restoring an active session.
     """
     try:
         r = urequests.get(MIDDLEWARE_URL + "/session/current")
@@ -529,26 +528,26 @@ def fetch_session(boot_sync=False):
                         print("[SESSION] Ignoring active=False — start cooldown")
                         server_active = True
 
-                # KEY FIX — consecutive false count guard
+                # Consecutive false count guard
+                # Use higher threshold when paused — paused sessions end via badge only
                 if state["session_active"] and not server_active:
                     state["session_false_count"] += 1
-                    print("[SESSION] active=False count:", state["session_false_count"],
-                          "/", SESSION_FALSE_THRESHOLD)
-                    if state["session_false_count"] < SESSION_FALSE_THRESHOLD:
-                        # Not enough consecutive false responses — keep session alive
+                    threshold = (SESSION_FALSE_THRESHOLD_PAUSED
+                                 if state["session_paused"]
+                                 else SESSION_FALSE_THRESHOLD)
+                    print("[SESSION] active=False count: {}/{}".format(
+                        state["session_false_count"], threshold))
+                    if state["session_false_count"] < threshold:
                         server_active = True
                 else:
-                    # Server says active=True — reset counter and refresh start guard
                     if server_active:
                         state["session_false_count"] = 0
-                        # Refresh the start guard so it never expires during a long session
                         if state["session_active"]:
                             state["session_start_ms"] = time.ticks_ms()
 
             prev_active             = state["session_active"]
             state["session_active"] = server_active
 
-            # Server has definitively confirmed session ended → clean up
             if prev_active and not state["session_active"]:
                 state["session_paused"]      = False
                 state["active_card_id"]      = None
@@ -557,12 +556,16 @@ def fetch_session(boot_sync=False):
                 print("[SESSION] Server ended session — local reset")
 
             if boot_sync:
-                state["session_paused"]      = data.get("paused", False)
-                state["active_card_id"]      = (
+                state["session_paused"]       = data.get("paused", False)
+                state["active_card_id"]       = (
                     data.get("card_id") or data.get("rfid_card_id")
                 )
-                state["work_seconds"]        = int(data.get("work_seconds", 0))
-                state["session_false_count"] = 0
+                state["work_seconds"]         = int(data.get("work_seconds", 0))
+                state["session_false_count"]  = 0
+                # BUG FIX: set session_start_ms so the 15s guard is active
+                # immediately after boot, not already expired.
+                if state["session_active"]:
+                    state["session_start_ms"] = time.ticks_ms()
                 print("[SESSION] Boot sync — active:", state["session_active"],
                       "paused:", state["session_paused"],
                       "card:", state["active_card_id"],
