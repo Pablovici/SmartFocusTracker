@@ -18,26 +18,28 @@ KNOWN_NETWORKS = [
     ("iPhone de Amir", "toad1234"),
     ("iot-unil",       "4u6uch4hpY9pJ2f9"),
 ]
-MIDDLEWARE_URL      = "https://smartfocustracker-middleware-1054003632036.europe-west6.run.app"
-SESSION_POLL_MS     = 10000   # Poll server every 10s (was 5s — reduces HTTP blocking)
-WIFI_CHECK_MS       = 30000   # Check WiFi alive every 30s
-BTN_DEBOUNCE_MS     = 500     # Minimum ms between two button events
+MIDDLEWARE_URL  = "https://smartfocustracker-middleware-1054003632036.europe-west6.run.app"
+SESSION_POLL_MS = 10000   # Server sync every 10s
+WIFI_CHECK_MS   = 30000   # WiFi health check every 30s
+BTN_DEBOUNCE_MS = 500     # Minimum ms between button events
 
 # ============================================================
 # DISPLAY CONSTANTS
 # ============================================================
-COLOR_BG        = 0x1a1a2e
-COLOR_WHITE     = 0xFFFFFF
-COLOR_GREY_SOFT = 0x999999
-COLOR_GREY_DIM  = 0x666666
-COLOR_DIVIDER   = 0x3a3a5e
-COLOR_GOOD      = 0x00CC44
-COLOR_WARN      = 0xFFAA00
-COLOR_BAD       = 0xFF4444
-COLOR_ACCENT    = 0x4fc3f7
-COLOR_WIFI      = 0x4fc3f7   # Same as accent — WiFi OK reads as positive
-SCREEN_W        = 320
-SCREEN_H        = 240
+COLOR_BG            = 0x1a1a2e
+COLOR_WHITE         = 0xFFFFFF
+COLOR_GREY_SOFT     = 0x999999
+COLOR_GREY_DIM      = 0x555577
+COLOR_DIVIDER       = 0x3a3a5e
+COLOR_GOOD          = 0x00CC44
+COLOR_WARN          = 0xFFAA00
+COLOR_BAD           = 0xFF4444
+COLOR_ACCENT        = 0x4fc3f7
+COLOR_WIFI          = 0x4fc3f7
+COLOR_CARD_ACTIVE   = 0x0d2b1a
+COLOR_CARD_INACTIVE = 0x22223a
+SCREEN_W            = 320
+SCREEN_H            = 240
 
 # ============================================================
 # HARDWARE INITIALIZATION
@@ -57,23 +59,15 @@ except Exception as e:
 # GLOBAL STATE
 # ============================================================
 state = {
-    "session_active":    False,
-    "session_paused":    False,
-    "work_seconds":      0,       # Computed from ticks — never overwritten by server
-    "active_card_id":    None,
-    "wifi_connected":    False,
-    "wifi_ssid":         "",
-    "screen":            "main",
-    "last_raw_card":     None,
-    "last_btn_ms":       0,
-
-    # FIX TIMER — real-time elapsed tracking
-    # session_start_ms: ticks_ms() at session start or last resume
-    # base_work_seconds: seconds accumulated before the current run (before pauses)
-    # Together they allow: work_seconds = base + (now - start) / 1000
-    # This means even if the loop blocks for 1s (HTTP), the timer catches up instantly.
-    "session_start_ms":  0,
-    "base_work_seconds": 0,
+    "session_active":  False,
+    "session_paused":  False,
+    "work_seconds":    0,       # Incremented by +1 each tick (simple, reliable)
+    "active_card_id":  None,
+    "wifi_connected":  False,
+    "wifi_ssid":       "",
+    "screen":          "main",
+    "last_raw_card":   None,
+    "last_btn_ms":     0,
 }
 
 _last_drawn = {
@@ -89,8 +83,7 @@ _last_drawn = {
 
 def connect_wifi_network(ssid, password):
     """
-    Connects to a single WiFi network.
-    Polls wlan.isconnected() up to 10 times (1s each).
+    Connects to one WiFi network. Polls for up to 10s.
     Returns True on success, updates state accordingly.
     """
     wlan = network.WLAN(network.STA_IF)
@@ -113,7 +106,7 @@ def connect_wifi_network(ssid, password):
     return False
 
 def connect_wifi():
-    """Try each known network in order. Fall back to offline on all failure."""
+    """Try each KNOWN_NETWORK in order. Fall back to offline."""
     for ssid, password in KNOWN_NETWORKS:
         if connect_wifi_network(ssid, password):
             return True
@@ -123,8 +116,7 @@ def connect_wifi():
 
 def check_wifi_alive():
     """
-    Silent background WiFi health check.
-    If connection dropped, tries to reconnect without touching the screen.
+    Silent background reconnect — does not touch the screen.
     Called every WIFI_CHECK_MS from the main loop.
     """
     wlan = network.WLAN(network.STA_IF)
@@ -147,52 +139,7 @@ def check_wifi_alive():
     print("[WiFi] Reconnect failed")
 
 # ============================================================
-# TIMER — real-time computation
-# ============================================================
-
-def _compute_work_seconds():
-    """
-    FIX TIMER — computes elapsed work seconds from real ticks, not increments.
-
-    Previous approach: work_seconds += 1 each loop tick.
-    Problem: if the loop blocks for 1-2s (HTTP request in fetch_session),
-    the increment is skipped → timer jumps irregularly.
-
-    New approach: work_seconds = base_work_seconds + (now - session_start_ms) / 1000
-    - base_work_seconds accumulates all time before the current run (pre-pause)
-    - session_start_ms is the ticks_ms() when the current run started
-    - Result: even if the loop blocks, the next call to _compute_work_seconds()
-      catches up instantly because it reads real clock time.
-    """
-    if not state["session_active"] or state["session_paused"]:
-        return state["work_seconds"]   # Return frozen value when paused
-    if not state["session_start_ms"]:
-        return state["work_seconds"]
-    elapsed_ms = time.ticks_diff(time.ticks_ms(), state["session_start_ms"])
-    return state["base_work_seconds"] + max(0, elapsed_ms // 1000)
-
-def _start_timer():
-    """Called on session start or resume — records the ticks_ms() reference point."""
-    state["session_start_ms"] = time.ticks_ms()
-
-def _pause_timer():
-    """
-    Called on pause — freezes work_seconds at the current real value.
-    base_work_seconds absorbs the elapsed time so it's preserved across pauses.
-    session_start_ms is zeroed so _compute_work_seconds returns the frozen value.
-    """
-    state["work_seconds"]      = _compute_work_seconds()
-    state["base_work_seconds"] = state["work_seconds"]
-    state["session_start_ms"]  = 0
-
-def _reset_timer():
-    """Called on session end — resets all timer state."""
-    state["work_seconds"]      = 0
-    state["base_work_seconds"] = 0
-    state["session_start_ms"]  = 0
-
-# ============================================================
-# DISPLAY — helpers
+# DISPLAY — low-level helpers
 # ============================================================
 
 def _draw_boot_msg(msg):
@@ -201,16 +148,25 @@ def _draw_boot_msg(msg):
     lcd.print(msg, 10, 100, COLOR_ACCENT)
 
 def _cx(text, char_w, offset=0):
-    """Returns x to horizontally centre text. char_w must match the active font."""
+    """Centres text horizontally. char_w must match the active font."""
     return max(0, (SCREEN_W - len(text) * char_w) // 2 + offset)
 
 def _rx(text, char_w, margin=10):
-    """
-    Returns x to right-align text with a given right margin.
-    char_w must match the active font.
-    Used to place WiFi status at the BtnC (right) position.
-    """
+    """Right-aligns text from the right edge."""
     return max(0, SCREEN_W - len(text) * char_w - margin)
+
+def _split_ssid(ssid, max_chars=11):
+    """
+    Splits a long SSID into two lines to fit inside a narrow card.
+    Breaks at the last space before max_chars.
+    Example: "iPhone de Amir" -> ["iPhone de", "Amir"]
+    """
+    if len(ssid) <= max_chars:
+        return [ssid, ""]
+    idx = ssid.rfind(" ", 0, max_chars)
+    if idx > 0:
+        return [ssid[:idx], ssid[idx + 1:]]
+    return [ssid[:max_chars], ssid[max_chars:]]
 
 def _draw_header():
     lcd.font(lcd.FONT_DejaVu18)
@@ -219,76 +175,105 @@ def _draw_header():
     lcd.line(0, 32, SCREEN_W, 32, COLOR_DIVIDER)
 
 def _draw_time_zone(work_str):
-    """
-    Partial redraw — erases only the time rectangle before rewriting.
-    Avoids screen ghosting without clearing the whole screen.
-    """
+    """Partial redraw — erases only the time zone rectangle."""
     lcd.fillRect(0, 134, SCREEN_W, 42, COLOR_BG)
     lcd.font(lcd.FONT_DejaVu24)
     lcd.print(work_str, _cx(work_str, 15, -4), 140, COLOR_WHITE)
 
+# ============================================================
+# DISPLAY — bottom bars
+# ============================================================
+
 def _draw_bottom_bar(pause_label):
     """
-    New bottom bar layout:
-
-      y=188: ──────────── divider ────────────
-      y=196:      TAP TO END (centred)
-      y=216: PAUSE/RESUME          WiFi OK/No WiFi
-             ↑ BtnA (left)         ↑ BtnC (right)
-
-    - "TAP TO END" is always centred and at a fixed y — easy to find.
-    - PAUSE/RESUME is bottom-left aligned with BtnA physical position.
-    - WiFi status is bottom-right aligned with BtnC physical position.
-      It doubles as a status indicator and a hint that BtnB opens WiFi settings.
-
-    pause_label: "PAUSE" or "RESUME" depending on current state.
+    Session screen bottom bar:
+      y=188: divider
+      y=196: TAP TO END  (centred — always same position)
+      y=218: PAUSE/RESUME (left, BtnA) | WiFi OK/No WiFi (right, BtnC)
     """
     lcd.line(0, 188, SCREEN_W, 188, COLOR_DIVIDER)
     lcd.font(lcd.FONT_DejaVu18)
-
-    # Row 1: TAP TO END — always centred, always at y=196
     tap = "TAP TO END"
-    lcd.print(tap, _cx(tap, 11, -4), 196, COLOR_GREY_SOFT)
-
-    # Row 2 left: PAUSE or RESUME at x=10, y=216 — aligns with BtnA
-    lcd.print(pause_label, 10, 218, COLOR_WARN)
-
-    # Row 2 right: WiFi status right-aligned — aligns with BtnC
-    if state["wifi_connected"]:
-        wifi_text  = "WiFi OK"
-        wifi_color = COLOR_WIFI
-    else:
-        wifi_text  = "No WiFi"
-        wifi_color = COLOR_BAD
+    lcd.print(tap,         _cx(tap, 11, -4),      196, COLOR_GREY_SOFT)
+    lcd.print(pause_label, 10,                     218, COLOR_WARN)
+    wifi_text  = "WiFi OK" if state["wifi_connected"] else "No WiFi"
+    wifi_color = COLOR_WIFI if state["wifi_connected"] else COLOR_BAD
     lcd.print(wifi_text, _rx(wifi_text, 11, 10), 218, wifi_color)
 
 def _draw_idle_bottom():
     """
-    Bottom bar for idle screen (no active session).
-    Shows a hint to open WiFi settings, and WiFi status on the right.
+    Idle screen bottom bar — WiFi status on the right (BtnC position).
     """
     lcd.line(0, 188, SCREEN_W, 188, COLOR_DIVIDER)
     lcd.font(lcd.FONT_DejaVu18)
-    # Left: BtnB hint
-    lcd.print("WiFi", 10, 218, COLOR_GREY_DIM)
-    # Right: current WiFi status at BtnC position
-    if state["wifi_connected"]:
-        wifi_text  = "WiFi OK"
-        wifi_color = COLOR_WIFI
-    else:
-        wifi_text  = "No WiFi"
-        wifi_color = COLOR_BAD
+    wifi_text  = "WiFi OK" if state["wifi_connected"] else "No WiFi"
+    wifi_color = COLOR_WIFI if state["wifi_connected"] else COLOR_BAD
     lcd.print(wifi_text, _rx(wifi_text, 11, 10), 218, wifi_color)
 
 # ============================================================
-# DISPLAY — full screen draws
+# DISPLAY — WiFi selection screen
+# ============================================================
+
+def _draw_wifi_card(x, y, w, h, ssid):
+    """
+    Draws one network card. Active network gets a green-tinted background
+    and a coloured top border. Inactive cards are dark.
+    SSID is split into two lines if needed.
+    ASCII-only status text for MicroPython bitmap font compatibility.
+    """
+    is_active = state["wifi_connected"] and state["wifi_ssid"] == ssid
+    bg        = COLOR_CARD_ACTIVE if is_active else COLOR_CARD_INACTIVE
+    lcd.fillRect(x, y, w, h, bg)
+
+    top_color = COLOR_GOOD if is_active else COLOR_DIVIDER
+    lcd.line(x,     y,     x + w, y,     top_color)
+    lcd.line(x,     y,     x,     y + h, COLOR_DIVIDER)
+    lcd.line(x + w, y,     x + w, y + h, COLOR_DIVIDER)
+    lcd.line(x,     y + h, x + w, y + h, COLOR_DIVIDER)
+
+    lines      = _split_ssid(ssid, 11)
+    name_color = COLOR_WHITE if is_active else COLOR_GREY_SOFT
+    lcd.font(lcd.FONT_DejaVu18)
+    lcd.print(lines[0], x + 7, y + 10, name_color)
+    if lines[1]:
+        lcd.print(lines[1], x + 7, y + 30, name_color)
+
+    if is_active:
+        lcd.print(">> Active", x + 7, y + 72, COLOR_GOOD)
+    else:
+        lcd.print("Tap to",   x + 7, y + 68, COLOR_GREY_DIM)
+        lcd.print("connect",  x + 7, y + 88, COLOR_GREY_DIM)
+
+def draw_wifi_screen():
+    """
+    WiFi selection screen.
+    Two network cards side by side. Bottom bar labels aligned with
+    physical button positions — no "BtnA/BtnC" jargon.
+
+    BtnA (left)   → "< Connect" → connects to KNOWN_NETWORKS[0]
+    BtnB (middle) → "Cancel"    → goes back without changing network
+    BtnC (right)  → "Connect >" → connects to KNOWN_NETWORKS[1]
+    """
+    lcd.clear(COLOR_BG)
+    lcd.font(lcd.FONT_DejaVu18)
+    title = "WiFi Selection"
+    lcd.print(title, _cx(title, 11, -4), 8, COLOR_ACCENT)
+    lcd.line(0, 30, SCREEN_W, 30, COLOR_DIVIDER)
+
+    _draw_wifi_card(6,   40, 146, 138, KNOWN_NETWORKS[0][0])
+    _draw_wifi_card(168, 40, 146, 138, KNOWN_NETWORKS[1][0])
+
+    lcd.line(0, 188, SCREEN_W, 188, COLOR_DIVIDER)
+    lcd.font(lcd.FONT_DejaVu18)
+    lcd.print("< Connect",  10,                          205, COLOR_ACCENT)
+    lcd.print("Cancel",     _cx("Cancel", 11, -4),       205, COLOR_GREY_SOFT)
+    lcd.print("Connect >",  _rx("Connect >", 11, 10),    205, COLOR_ACCENT)
+
+# ============================================================
+# DISPLAY — main screens
 # ============================================================
 
 def draw_idle_screen():
-    """
-    Idle screen — shown when no session is active.
-    Large "TAP TO / START" prompt invites badge tap.
-    """
     lcd.clear(COLOR_BG)
     _draw_header()
     lcd.font(lcd.FONT_DejaVu40)
@@ -299,11 +284,6 @@ def draw_idle_screen():
     _update_last_drawn()
 
 def draw_session_screen():
-    """
-    Active session screen (WORKING or PAUSED).
-    Calls _compute_work_seconds() so the time zone always shows
-    the real elapsed value at draw time, even after HTTP blocking.
-    """
     lcd.clear(COLOR_BG)
     _draw_header()
     if state["session_paused"]:
@@ -314,8 +294,6 @@ def draw_session_screen():
         pause_label = "PAUSE"
     lcd.font(lcd.FONT_DejaVu56)
     lcd.print(status_text, _cx(status_text, 34, -12), 62, status_color)
-    # Compute real work_seconds before drawing
-    state["work_seconds"] = _compute_work_seconds()
     _draw_time_zone(format_seconds(state["work_seconds"]))
     _draw_bottom_bar(pause_label)
     _update_last_drawn()
@@ -323,27 +301,16 @@ def draw_session_screen():
 def draw_time_only():
     """
     Lightweight partial redraw — only the time zone.
-    Called every second when only work_seconds changed.
-    Avoids the cost of lcd.clear() on every tick.
+    Called once per second when only work_seconds changed.
     """
-    state["work_seconds"] = _compute_work_seconds()
     _draw_time_zone(format_seconds(state["work_seconds"]))
     _last_drawn["work_seconds"] = state["work_seconds"]
 
 def draw_error_screen(message, duration=3):
-    """
-    Large centred error screen shown on wrong card tap.
-
-    FIX WRONG CARD POSITION:
-    - DejaVu40 on M5Stack Core2 has an actual char width of ~23px
-      (not 26 as previously assumed). Using 23 centres the text correctly.
-    - y moved from 85 to 100 — vertically more centred between header and middle.
-    - Subtitle moved from 145 to 158 to match.
-    """
+    """Large centred error message with subtitle."""
     lcd.clear(COLOR_BG)
     _draw_header()
     lcd.font(lcd.FONT_DejaVu40)
-    # char_w=23 for DejaVu40 on M5Stack Core2 (measured empirically)
     x = max(10, (SCREEN_W - len(message) * 23) // 2)
     lcd.print(message, x, 100, COLOR_BAD)
     hint = "Only same card can end"
@@ -352,37 +319,13 @@ def draw_error_screen(message, duration=3):
     time.sleep(duration)
     draw_session_screen() if state["session_active"] else draw_idle_screen()
 
-def draw_wifi_screen():
-    """
-    WiFi selection overlay.
-    BtnA → KNOWN_NETWORKS[0], BtnC → KNOWN_NETWORKS[1], BtnB → cancel.
-    Non-blocking: this function only draws — buttons handled in handle_buttons().
-    """
-    lcd.clear(COLOR_BG)
-    lcd.font(lcd.FONT_DejaVu18)
-    lcd.print("- WiFi Setup -", _cx("- WiFi Setup -", 11, -4), 10, COLOR_ACCENT)
-    lcd.line(0, 32, SCREEN_W, 32, COLOR_DIVIDER)
-    lcd.print("BtnA:", 10, 60, COLOR_GREY_SOFT)
-    lcd.print(KNOWN_NETWORKS[0][0], 80, 60, COLOR_WHITE)
-    lcd.print("BtnC:", 10, 95, COLOR_GREY_SOFT)
-    lcd.print(KNOWN_NETWORKS[1][0], 80, 95, COLOR_WHITE)
-    lcd.line(0, 130, SCREEN_W, 130, COLOR_DIVIDER)
-    lcd.print("BtnB: back", _cx("BtnB: back", 11, -4), 142, COLOR_GREY_DIM)
-    if state["wifi_connected"]:
-        current = "Now: {}".format(state["wifi_ssid"])
-        lcd.print(current, _cx(current, 11, -4), 170, COLOR_WIFI)
-
 # ============================================================
 # DISPLAY — utilities
 # ============================================================
 
 def format_seconds(seconds):
-    """
-    Converts raw seconds to a human-readable string.
-    Uses integer arithmetic only — no floats (MicroPython safe).
-    """
-    if not seconds:
-        return "0s"
+    """Human-readable elapsed time. Integer arithmetic only."""
+    if not seconds: return "0s"
     s = int(seconds) % 60
     m = int(seconds) // 60
     h = m // 60
@@ -398,7 +341,6 @@ def _update_last_drawn():
     _last_drawn["work_seconds"]   = state["work_seconds"]
 
 def _status_changed():
-    """True if a major state change requires a full screen redraw."""
     return (
         state["session_active"] != _last_drawn["session_active"] or
         state["session_paused"] != _last_drawn["session_paused"] or
@@ -406,7 +348,6 @@ def _status_changed():
     )
 
 def _time_changed():
-    """True if work_seconds advanced — triggers a lightweight time-only redraw."""
     return state["work_seconds"] != _last_drawn["work_seconds"]
 
 # ============================================================
@@ -415,9 +356,8 @@ def _time_changed():
 
 def read_rfid():
     """
-    Polls the RFID reader. Returns a UID only on a fresh tap.
-    De-duplication: last_raw_card prevents a held card from firing repeatedly.
-    Resets to None when card is removed so the next tap fires correctly.
+    Returns a UID only on a fresh tap.
+    Resets last_raw_card to None when card is removed.
     """
     try:
         if rfid.isCardOn():
@@ -434,18 +374,21 @@ def read_rfid():
 def handle_rfid(card_id):
     """
     Same card → start if idle, end if active.
-    Different card while active → error screen, session continues.
-    Timer helpers called here to keep timing accurate.
+    Different card → error screen, session continues.
+    Fallback: if active_card_id is None (not restored from server),
+    accept any card so the user is never stuck.
     """
     if not state["session_active"]:
         post_session_event("start", card_id)
         state["session_active"] = True
         state["session_paused"] = False
+        state["work_seconds"]   = 0
         state["active_card_id"] = card_id
-        _reset_timer()
-        _start_timer()   # Start real-time tracking
         print("[RFID] Session started:", card_id)
     else:
+        if state["active_card_id"] is None:
+            print("[RFID] active_card_id unknown — claiming with:", card_id)
+            state["active_card_id"] = card_id
         if card_id != state["active_card_id"]:
             print("[RFID] Wrong card:", card_id)
             draw_error_screen("Wrong card!", duration=3)
@@ -453,8 +396,8 @@ def handle_rfid(card_id):
         post_session_event("end", card_id)
         state["session_active"] = False
         state["session_paused"] = False
+        state["work_seconds"]   = 0
         state["active_card_id"] = None
-        _reset_timer()
         print("[RFID] Session ended:", card_id)
 
 # ============================================================
@@ -462,11 +405,7 @@ def handle_rfid(card_id):
 # ============================================================
 
 def _btn_allowed():
-    """
-    Debounce guard — returns True only if BTN_DEBOUNCE_MS
-    has elapsed since the last button event.
-    Prevents a single physical press from registering multiple times.
-    """
+    """Debounce guard — returns True only if BTN_DEBOUNCE_MS has elapsed."""
     now = time.ticks_ms()
     if time.ticks_diff(now, state["last_btn_ms"]) < BTN_DEBOUNCE_MS:
         return False
@@ -475,13 +414,14 @@ def _btn_allowed():
 
 def handle_buttons():
     """
-    All button logic in one place — works for both screens.
+    WiFi screen:
+      BtnA (left)   → connect to KNOWN_NETWORKS[0]
+      BtnB (middle) → cancel / back
+      BtnC (right)  → connect to KNOWN_NETWORKS[1]
 
-    WiFi screen: BtnA/BtnC connect, BtnB cancels.
-    Main screen: BtnA pauses/resumes, BtnB opens WiFi screen.
-
-    Pause/resume uses _pause_timer() and _start_timer() to ensure
-    the real-time elapsed tracking stays accurate across state changes.
+    Main screen:
+      BtnA (left)   → pause / resume
+      BtnC (right)  → open WiFi screen
     """
     if state["screen"] == "wifi":
         if btnA.wasPressed() and _btn_allowed():
@@ -489,12 +429,12 @@ def handle_buttons():
             connect_wifi_network(ssid, pwd)
             state["screen"] = "main"
             draw_session_screen() if state["session_active"] else draw_idle_screen()
+        elif btnB.wasPressed() and _btn_allowed():
+            state["screen"] = "main"
+            draw_session_screen() if state["session_active"] else draw_idle_screen()
         elif btnC.wasPressed() and _btn_allowed():
             ssid, pwd = KNOWN_NETWORKS[1]
             connect_wifi_network(ssid, pwd)
-            state["screen"] = "main"
-            draw_session_screen() if state["session_active"] else draw_idle_screen()
-        elif btnB.wasPressed() and _btn_allowed():
             state["screen"] = "main"
             draw_session_screen() if state["session_active"] else draw_idle_screen()
         return
@@ -503,34 +443,25 @@ def handle_buttons():
         if not state["session_active"]:
             return
         if state["session_paused"]:
-            # Resume: restart the real-time tracking from current base
             post_session_event("resume", None)
             state["session_paused"] = False
-            _start_timer()
             print("[BTN] Resumed")
         else:
-            # Pause: freeze the timer at current real value
             post_session_event("pause", None)
-            _pause_timer()
             state["session_paused"] = True
-            print("[BTN] Paused — work_seconds:", state["work_seconds"])
-        # Force immediate redraw so the screen reflects the new state
+            print("[BTN] Paused")
         draw_session_screen()
 
-    if btnB.wasPressed() and _btn_allowed():
+    if btnC.wasPressed() and _btn_allowed():
         state["screen"] = "wifi"
         draw_wifi_screen()
 
 # ============================================================
-# DATA — posting and fetching
+# DATA
 # ============================================================
 
 def post_session_event(event_type, card_id):
-    """
-    POSTs a session lifecycle event to the middleware.
-    No timeout parameter — not supported in MicroPython urequests.
-    gc.collect() called after every network op to reclaim memory.
-    """
+    """POSTs a session lifecycle event. No timeout — not supported in MicroPython."""
     payload = {"event": event_type, "card_id": card_id}
     try:
         r = urequests.post(
@@ -546,44 +477,34 @@ def post_session_event(event_type, card_id):
 
 def fetch_session(boot_sync=False):
     """
-    GETs /session/current from middleware.
-
-    What IS synced:
-    - session_active: always — it changes only via RFID, safe to follow server.
-
-    What is NEVER synced after boot:
-    - session_paused: server state can lag behind local button presses,
-      causing the pause to flip by itself. Device is sole source of truth.
-    - work_seconds: tracked locally via ticks_ms — server value is unreliable.
-
-    boot_sync=True (only at startup):
-    - Also restores session_paused and work_seconds from server.
-    - Allows the device to resume a session that was active before a reboot.
+    GETs /session/current.
+    Always syncs session_active.
+    On boot only: also restores session_paused, work_seconds, active_card_id.
+    Never syncs paused or work_seconds during normal polling —
+    the device is the sole source of truth for those after boot.
     """
     try:
         r = urequests.get(MIDDLEWARE_URL + "/session/current")
         if r.status_code == 200:
             data = ujson.loads(r.text)
 
-            prev_active           = state["session_active"]
+            prev_active             = state["session_active"]
             state["session_active"] = data.get("active", False)
 
-            # If server says session ended while we thought it was active → clean up
             if prev_active and not state["session_active"]:
                 state["session_paused"]  = False
                 state["active_card_id"]  = None
-                _reset_timer()
+                state["work_seconds"]    = 0
                 print("[SESSION] Server ended session — local reset")
 
             if boot_sync:
-                state["session_paused"]    = data.get("paused", False)
-                server_seconds             = int(data.get("work_seconds", 0))
-                state["work_seconds"]      = server_seconds
-                state["base_work_seconds"] = server_seconds
-                # If session is active and not paused, start the local timer
-                if state["session_active"] and not state["session_paused"]:
-                    _start_timer()
-                print("[SESSION] Boot sync OK — work_seconds:", server_seconds)
+                state["session_paused"]  = data.get("paused", False)
+                state["active_card_id"]  = data.get("card_id") or data.get("rfid_card_id")
+                state["work_seconds"]    = int(data.get("work_seconds", 0))
+                print("[SESSION] Boot sync — active:", state["session_active"],
+                      "paused:", state["session_paused"],
+                      "card:", state["active_card_id"],
+                      "seconds:", state["work_seconds"])
 
         r.close()
     except Exception as e:
@@ -595,13 +516,6 @@ def fetch_session(boot_sync=False):
 # ============================================================
 
 def boot():
-    """
-    Startup sequence:
-    1. Boot splash
-    2. WiFi connection
-    3. Full session sync from server (boot_sync=True)
-    4. Draw correct initial screen
-    """
     _draw_boot_msg("Booting...")
     time.sleep(1)
     connect_wifi()
@@ -616,59 +530,77 @@ def boot():
 
 def loop():
     """
-    Main event loop — runs forever at ~100ms per cycle.
+    1-second tick loop with compensated sleep.
 
-    Timer accuracy fix:
-    The loop no longer increments work_seconds by +1 per tick.
-    Instead, _compute_work_seconds() is called at draw time and
-    computes the exact elapsed value from ticks_ms(). This means
-    HTTP blocking (fetch_session) no longer causes timer jumps —
-    the next draw immediately shows the correct accumulated time.
+    WHY THIS APPROACH:
+    The test UI version used time.sleep(1) + work_seconds += 1 and the
+    timer was perfectly smooth. That worked because the loop body was
+    instant (no I/O). In the full version, fetch_session() HTTP calls
+    take 500-1500ms, eating into the sleep and causing irregular ticks.
 
-    Screen redraws:
-    - Full redraw: if session_active, session_paused or wifi_connected changed
-    - Partial redraw (time zone only): if work_seconds advanced by ≥1 second
+    FIX — compensated sleep:
+    We measure how long the loop body took (including any HTTP calls),
+    then sleep only the REMAINING time to reach 1000ms total.
+    Examples:
+      Loop body = 50ms  → sleep 950ms → total 1000ms  (smooth tick)
+      Loop body = 800ms → sleep 200ms → total 1000ms  (smooth tick)
+      Loop body = 1200ms → sleep 0ms  → total 1200ms  (rare, 1 late tick)
+
+    This gives the same smooth second-by-second feel as the test version,
+    while still handling all the production I/O.
     """
-    last_poll_ms  = time.ticks_ms()
-    last_wifi_ms  = time.ticks_ms()
+    last_poll_ms = time.ticks_ms()
+    last_wifi_ms = time.ticks_ms()
 
     while True:
-        now_ms = time.ticks_ms()
+        # Record the start of this tick — used for compensated sleep at the end
+        tick_start_ms = time.ticks_ms()
 
-        # Step 1: buttons (both screens)
+        # --- Step 1: buttons (both screens) ---
         handle_buttons()
 
-        # Step 2: RFID (main screen only — not while navigating WiFi menu)
+        # --- Step 2: RFID (main screen only) ---
         if state["screen"] == "main":
             card_id = read_rfid()
             if card_id:
                 handle_rfid(card_id)
 
-        # Step 3: periodic server sync
+        # --- Step 3: periodic server sync ---
+        now_ms = time.ticks_ms()
         if time.ticks_diff(now_ms, last_poll_ms) >= SESSION_POLL_MS:
             if state["wifi_connected"]:
                 fetch_session(boot_sync=False)
-            last_poll_ms = now_ms
+            last_poll_ms = time.ticks_ms()   # Reset AFTER the call
 
-        # Step 4: periodic WiFi health check
+        # --- Step 4: periodic WiFi health check ---
+        now_ms = time.ticks_ms()
         if time.ticks_diff(now_ms, last_wifi_ms) >= WIFI_CHECK_MS:
             check_wifi_alive()
-            last_wifi_ms = now_ms
+            last_wifi_ms = time.ticks_ms()
 
-        # Step 5: compute current work_seconds from real ticks
-        # This runs every loop cycle — cheap (no HTTP, no LCD)
+        # --- Step 5: increment work timer ---
+        # Simple +1 per tick — identical to the test version that worked perfectly.
+        # Slight imprecision during slow HTTP ticks is imperceptible in practice.
         if state["session_active"] and not state["session_paused"]:
-            state["work_seconds"] = _compute_work_seconds()
+            state["work_seconds"] = (state["work_seconds"] or 0) + 1
 
-        # Step 6: smart redraw (main screen only)
+        # --- Step 6: smart redraw ---
         if state["screen"] == "main":
             if _status_changed():
                 draw_session_screen() if state["session_active"] else draw_idle_screen()
             elif state["session_active"] and _time_changed():
                 draw_time_only()
 
+        # --- Step 7: compensated sleep ---
+        # Measure elapsed time for this entire iteration.
+        # Sleep only what remains to reach 1000ms.
+        # This ensures every tick is as close to 1 second as possible
+        # regardless of how long the I/O operations took.
         gc.collect()
-        time.sleep_ms(100)   # 100ms cycle — responsive + CPU-friendly
+        elapsed_ms = time.ticks_diff(time.ticks_ms(), tick_start_ms)
+        remaining_ms = max(0, 1000 - elapsed_ms)
+        if remaining_ms > 0:
+            time.sleep_ms(remaining_ms)
 
 # ============================================================
 # ENTRY POINT
