@@ -1,3 +1,9 @@
+# device_a/main.py
+# Main device — weather display, sensors, voice assistant, session status.
+# Sensors: SHT30 (temp/humidity), SGP30 (CO2/TVOC), PIR (motion)
+# MicroPython — deployed via UIFlow 1.0
+# Assigned to: Amir
+
 import gc
 import os
 import time
@@ -13,23 +19,26 @@ from m5stack import lcd, btnA, btnB, btnC, speaker, rgb
 from MediaTrans.MicRecord import MicRecord
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 MIDDLEWARE_URL   = "https://smartfocustracker-middleware-1054003632036.europe-west6.run.app"
 CLOUD_HOST       = "smartfocustracker-middleware-1054003632036.europe-west6.run.app"
 CLOUD_PORT       = 443
 NTP_UTC_OFFSET   = 2          # UTC+2 CEST (Lausanne, mars-oct) / UTC+1 CET (nov-fév)
-SENSOR_INTERVAL  = 10        # lecture capteurs toutes les 10s
-BQ_INTERVAL      = 20        # envoi BigQuery toutes les 20s
-DRAW_INTERVAL    = 5
+SENSOR_INTERVAL  = 10         # Read sensors every 10s
+BQ_INTERVAL      = 30         # Post to BigQuery every 30s (offset from sensor to avoid collisions)
+DRAW_INTERVAL    = 5          # Redraw screen every 5s
 HUMIDITY_MIN     = 40
-WEATHER_INTERVAL = 1800       # 30 min entre fetch météo
+WEATHER_INTERVAL = 1800        # Fetch weather every 30 min
 ALERT_COOLDOWN   = 3600
 BREAK_INTERVAL   = 3600
-PIR_ABSENT_ALERT = 300        # 5 min sans mouvement → alerte
+PIR_ABSENT_ALERT = 300         # Alert after 5 min without motion
 RECORD_SECS      = 5
 VOICE_FILE       = '/flash/voice.wav'
 RESP_FILE        = '/flash/res/resp.wav'
+# Device A is display-only for sessions — polls less frequently than Device B
+# to avoid competing with Device B's session sync on the same Flask server.
+SESSION_INTERVAL = 15
 
 KNOWN_NETWORKS = [
     ("iPhone de Amir", "toad1234"),
@@ -104,7 +113,7 @@ class SGP30:
         return (data[3] << 8) | data[4]
 
 # ============================================================
-# HARDWARE INIT
+# HARDWARE INITIALIZATION
 # ============================================================
 i2c_a = I2C(1, scl=Pin(33), sda=Pin(32), freq=100000)
 i2c_c = I2C(scl=Pin(13), sda=Pin(14), freq=100000)
@@ -121,7 +130,7 @@ except:
 
 # ============================================================
 # STATE
-# Screens: 0=main  1=session  2=answer  3=forecast  4=wifi
+# Screens: 0=main  2=answer  3=forecast  4=wifi
 # ============================================================
 state = {
     "temperature": None, "humidity": None,
@@ -135,13 +144,15 @@ state = {
 alert_times      = {"weather": 0, "humidity": 0, "air": 0, "break": 0, "absent": 0}
 last_motion_time = 0
 current_screen   = 0
-last_answer    = ""
-last_question  = ""
+last_answer      = ""
+last_question    = ""
 
 # ============================================================
 # HELPERS
 # ============================================================
+
 def classify_air(co2):
+    # Returns a human-readable air quality label based on CO2 ppm.
     if co2 is None: return "Unknown"
     if co2 < 800:   return "Good"
     if co2 < 1000:  return "Moderate"
@@ -152,17 +163,14 @@ def air_color(label):
     if label == "Moderate": return COLOR_WARN
     return COLOR_BAD
 
-def format_seconds(s):
-    if not s: return "0min"
-    m = int(s // 60); h = int(m // 60); m = m % 60
-    return "{}h {}m".format(h, m) if h > 0 else "{}min".format(m)
-
 def show_msg(msg):
+    # Full-screen message — used during boot and WiFi connection.
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print(msg, 10, 100, COLOR_WHITE)
 
 def get_time_strings():
+    # Returns (time_str, date_str) adjusted for the local UTC offset.
     t = time.localtime(time.time() + NTP_UTC_OFFSET * 3600)
     days   = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
     months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
@@ -177,6 +185,7 @@ def safe_remove(path):
     except: pass
 
 def condition_color(cond):
+    # Maps a weather condition string to a display color.
     c = cond.lower()
     if "thunder" in c or "storm" in c:                 return COLOR_STORM
     if "snow" in c or "sleet" in c:                    return COLOR_SNOW
@@ -187,6 +196,7 @@ def condition_color(cond):
     return COLOR_WHITE
 
 def date_to_dayname(date_str, today_str):
+    # Converts a YYYY-MM-DD string to a short day name (e.g. "Mon", "Today").
     days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     if date_str == today_str:
         return "Today"
@@ -204,10 +214,9 @@ def today_str():
 # WEATHER ICONS — drawn with LCD primitives (no image files)
 # cx/cy = center of the icon bounding box (~18x18px)
 # ============================================================
+
 def _icon_sun(cx, cy):
-    # Core circle
     lcd.fillCircle(cx, cy, 5, COLOR_SUN)
-    # 8 rays: (inner_x, inner_y, outer_x, outer_y)
     rays = [
         (cx,   cy-6,  cx,   cy-10),
         (cx+4, cy-4,  cx+7, cy-7),
@@ -222,7 +231,6 @@ def _icon_sun(cx, cy):
         lcd.line(x1, y1, x2, y2, COLOR_SUN)
 
 def _icon_cloud(cx, cy, col):
-    # Three overlapping circles + filled rect base
     lcd.fillCircle(cx-4, cy+1, 5, col)
     lcd.fillCircle(cx+3, cy-1, 6, col)
     lcd.fillCircle(cx-9, cy+3, 3, col)
@@ -230,70 +238,59 @@ def _icon_cloud(cx, cy, col):
 
 def _icon_rain(cx, cy):
     _icon_cloud(cx, cy-3, COLOR_CLOUD)
-    # Rain drops
     for rx, ry in [(cx-7, cy+6), (cx-2, cy+8), (cx+4, cy+6), (cx+9, cy+8)]:
         lcd.line(rx, ry, rx-2, ry+5, COLOR_RAIN)
 
 def _icon_heavy_rain(cx, cy):
-    _icon_cloud(cx, cy-4, 0x607D8B)  # darker cloud
+    _icon_cloud(cx, cy-4, 0x607D8B)
     for rx, ry in [(cx-8,cy+5),(cx-3,cy+7),(cx+2,cy+5),(cx+7,cy+7),(cx-5,cy+10),(cx+4,cy+10)]:
         lcd.line(rx, ry, rx-2, ry+6, COLOR_RAIN)
 
 def _icon_snow(cx, cy):
-    # Snowflake: 4 axes through center + center dot
     lcd.line(cx-8, cy,   cx+8, cy,   COLOR_SNOW)
     lcd.line(cx,   cy-8, cx,   cy+8, COLOR_SNOW)
     lcd.line(cx-6, cy-6, cx+6, cy+6, COLOR_SNOW)
     lcd.line(cx-6, cy+6, cx+6, cy-6, COLOR_SNOW)
     lcd.fillCircle(cx, cy, 2, COLOR_SNOW)
-    # Tips
     for tx, ty in [(cx-8,cy),(cx+8,cy),(cx,cy-8),(cx,cy+8)]:
         lcd.line(tx-2, ty-2, tx+2, ty+2, COLOR_SNOW)
 
 def _icon_storm(cx, cy):
-    _icon_cloud(cx, cy-4, 0x546E7A)  # dark blue-grey cloud
-    # Lightning bolt
-    lcd.line(cx+1, cy+3, cx-4, cy+10, 0xFFE000)
+    _icon_cloud(cx, cy-4, 0x546E7A)
+    lcd.line(cx+1, cy+3,  cx-4, cy+10, 0xFFE000)
     lcd.line(cx-4, cy+10, cx+1, cy+10, 0xFFE000)
     lcd.line(cx+1, cy+10, cx-3, cy+16, 0xFFE000)
 
 def _icon_mist(cx, cy):
-    # Horizontal dashed lines
     for my in [cy-5, cy-1, cy+3, cy+7]:
         lcd.line(cx-9, my, cx-3, my, COLOR_MIST)
         lcd.line(cx,   my, cx+6, my, COLOR_MIST)
         lcd.line(cx-6, my+2, cx+9, my+2, COLOR_MIST)
 
 def _icon_few_clouds(cx, cy):
-    # Small cloud + sun peeking behind
-    lcd.fillCircle(cx+4, cy+1, 5, COLOR_SUN)  # sun peek
+    lcd.fillCircle(cx+4, cy+1, 5, COLOR_SUN)
     lcd.line(cx+4, cy-5, cx+4, cy-8, COLOR_SUN)
     lcd.line(cx+9, cy+1, cx+12, cy+1, COLOR_SUN)
     _icon_cloud(cx-2, cy+2, COLOR_CLOUD)
 
 def draw_weather_icon(cx, cy, cond):
+    """Dispatches to the correct icon drawing function based on condition string."""
     c = cond.lower()
-    if "thunder" in c or "storm" in c:
-        _icon_storm(cx, cy)
-    elif "snow" in c or "sleet" in c:
-        _icon_snow(cx, cy)
-    elif "heavy rain" in c or "shower" in c:
-        _icon_heavy_rain(cx, cy)
-    elif "rain" in c or "drizzle" in c:
-        _icon_rain(cx, cy)
-    elif "clear" in c or "sun" in c:
-        _icon_sun(cx, cy)
-    elif "few clouds" in c or "scattered" in c:
-        _icon_few_clouds(cx, cy)
-    elif "mist" in c or "fog" in c or "haze" in c:
-        _icon_mist(cx, cy)
-    else:  # clouds / overcast
-        _icon_cloud(cx, cy, COLOR_CLOUD)
+    if "thunder" in c or "storm" in c:      _icon_storm(cx, cy)
+    elif "snow" in c or "sleet" in c:        _icon_snow(cx, cy)
+    elif "heavy rain" in c or "shower" in c: _icon_heavy_rain(cx, cy)
+    elif "rain" in c or "drizzle" in c:      _icon_rain(cx, cy)
+    elif "clear" in c or "sun" in c:         _icon_sun(cx, cy)
+    elif "few clouds" in c or "scattered" in c: _icon_few_clouds(cx, cy)
+    elif "mist" in c or "fog" in c or "haze" in c: _icon_mist(cx, cy)
+    else:                                    _icon_cloud(cx, cy, COLOR_CLOUD)
 
 # ============================================================
 # WIFI
 # ============================================================
+
 def connect_wifi():
+    """Tries each KNOWN_NETWORK in order on boot. Falls back to offline."""
     wlan.active(True)
     if wlan.isconnected(): return True
     for ssid, pwd in KNOWN_NETWORKS:
@@ -309,6 +306,11 @@ def connect_wifi():
     return False
 
 def connect_to_network(idx):
+    """
+    Connects to a specific network by index in KNOWN_NETWORKS.
+    Called from the WiFi selection screen (screen 4).
+    Shows live connection progress on screen.
+    """
     ssid, pwd = KNOWN_NETWORKS[idx]
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
@@ -331,7 +333,9 @@ def connect_to_network(idx):
 # ============================================================
 # SENSORS
 # ============================================================
+
 def read_sensors():
+    """Reads all physical sensors and updates state dict."""
     try:
         state["temperature"] = round(env.temperature, 1)
         state["humidity"]    = round(env.humidity, 1)
@@ -346,6 +350,7 @@ def read_sensors():
     state["air_quality_label"] = classify_air(state["co2_ppm"])
 
 def post_indoor():
+    """Posts current sensor readings to middleware → BigQuery."""
     payload = {
         "temperature": state["temperature"], "humidity": state["humidity"],
         "co2_ppm": state["co2_ppm"], "tvoc_ppb": state["tvoc_ppb"],
@@ -363,7 +368,13 @@ def post_indoor():
 # ============================================================
 # WEATHER & SESSION
 # ============================================================
+
 def fetch_weather():
+    """
+    Fetches current weather and forecast from middleware.
+    Middleware caches OpenWeatherMap results so this is cheap.
+    Called every WEATHER_INTERVAL (30 min).
+    """
     try:
         r = urequests.get(MIDDLEWARE_URL + "/weather")
         if r.status_code == 200:
@@ -378,6 +389,13 @@ def fetch_weather():
     gc.collect()
 
 def fetch_session():
+    """
+    Reads the active session state from middleware.
+    Device A is display-only — it never starts or ends sessions.
+    Polls at SESSION_INTERVAL (15s) instead of 5s to reduce server load
+    and avoid competing with Device B's session sync requests.
+    session_work_sec is stored for break-time alert logic (check_alerts).
+    """
     try:
         r = urequests.get(MIDDLEWARE_URL + "/session/current")
         if r.status_code == 200:
@@ -390,9 +408,11 @@ def fetch_session():
     gc.collect()
 
 def sync_latest():
-    # Restores last known sensor values from BigQuery on boot.
-    # Ensures the display shows meaningful data immediately,
-    # even before the live sensor cycle runs.
+    """
+    Restores last known sensor values from BigQuery on boot.
+    Ensures the display shows meaningful data immediately,
+    even before the first live sensor cycle runs.
+    """
     try:
         r = urequests.get(MIDDLEWARE_URL + "/latest")
         if r.status_code == 200:
@@ -415,7 +435,14 @@ def sync_latest():
 # ============================================================
 # HTTPS SOCKET — stream WAV to /ask
 # ============================================================
+
 def _ssl_post_wav_to_ask(filepath):
+    """
+    Streams a WAV file to POST /ask via raw SSL socket.
+    urequests cannot handle large binary payloads — raw socket is used instead.
+    The WAV is base64-encoded in chunks to stay within MicroPython RAM limits.
+    Returns (status_code, response_body) or (None, error_string).
+    """
     sz = file_size(filepath)
     if sz <= 0: return None, 'empty file'
     prefix   = b'{"audio_b64":"'
@@ -470,9 +497,16 @@ def _ssl_post_wav_to_ask(filepath):
             except: pass
 
 # ============================================================
-# HTTPS SOCKET — stream /speak-wav to file
+# HTTPS SOCKET — stream /speak-wav response to file
 # ============================================================
+
 def _ssl_post_to_wav_file(path, payload_dict, out_file):
+    """
+    POSTs a JSON payload to a middleware endpoint and saves the
+    raw WAV response body directly to a file on flash.
+    Used for TTS: sends text, receives and saves the audio file.
+    Returns (success_bool, message_string).
+    """
     body = ujson.dumps(payload_dict).encode('utf-8')
     req  = (
         'POST ' + path + ' HTTP/1.1\r\n'
@@ -525,7 +559,16 @@ def _ssl_post_to_wav_file(path, payload_dict, out_file):
 # ============================================================
 # VOICE FLOW
 # ============================================================
+
 def voice_flow():
+    """
+    Full push-to-talk pipeline:
+    1. Beep + prompt user to speak
+    2. Record RECORD_SECS seconds to VOICE_FILE
+    3. POST audio to /ask → STT + LLM + TTS on server
+    4. Save audio response to flash, play it
+    5. Display answer text on screen
+    """
     global last_answer, last_question, current_screen
     show_msg("Preparez-vous...")
     time.sleep(1)
@@ -572,9 +615,11 @@ def voice_flow():
     gc.collect()
 
 # ============================================================
-# ALERTS TTS
+# ALERTS & LEDS
 # ============================================================
+
 def speak(text):
+    """Posts text to /speak endpoint for TTS alert playback."""
     try:
         r = urequests.post(MIDDLEWARE_URL + "/speak",
             headers={"Content-Type": "application/json"},
@@ -584,13 +629,19 @@ def speak(text):
     gc.collect()
 
 def update_leds():
+    """Sets RGB LEDs to reflect current air quality."""
     label = state["air_quality_label"]
-    if label == "Good":     rgb.setColorAll(0x00CC00)
+    if label == "Good":       rgb.setColorAll(0x00CC00)
     elif label == "Moderate": rgb.setColorAll(0xFFAA00)
-    elif label == "Poor":   rgb.setColorAll(0xFF0000)
-    else:                   rgb.setColorAll(0x000000)
+    elif label == "Poor":     rgb.setColorAll(0xFF0000)
+    else:                     rgb.setColorAll(0x000000)
 
 def check_alerts():
+    """
+    Fires TTS alerts based on environmental and session conditions.
+    All alerts respect ALERT_COOLDOWN (1 hour) to avoid spamming.
+    Only fires when motion is detected — no point alerting an empty room.
+    """
     if not state["motion"]: return
     now = time.time()
     if now - alert_times["weather"] > ALERT_COOLDOWN:
@@ -617,41 +668,71 @@ def check_alerts():
                 alert_times["absent"] = now
 
 # ============================================================
-# DISPLAY — MAIN (screen 0)
+# DISPLAY — MAIN SCREEN (screen 0)
 # BtnA=WiFi  BtnB=Voice  BtnC=Forecast
 # ============================================================
+
 def draw_main_screen():
+    """
+    Main screen layout:
+    - Top: time + date
+    - Outdoor weather (temperature, condition)
+    - Divider
+    - Indoor: temperature, humidity
+    - Air quality
+    - Session status: No session / Working / Paused
+      (time is intentionally not shown — managed by Device B)
+    - Bottom: button hints
+    """
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print(state["time_str"], 10, 8, COLOR_WHITE)
     lcd.print(state["date_str"], 175, 8, COLOR_GREY)
+
     wcol = condition_color(state["weather_cond"])
     lcd.font(lcd.FONT_DejaVu24)
     lcd.print("{}C".format(state["weather_temp"]), 10, 40, wcol)
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print("{} {}".format(state["weather_cond"], state["weather_city"]), 10, 72, COLOR_GREY)
+
     lcd.line(0, 100, 320, 100, COLOR_DIVIDER)
+
     t = state["temperature"]; h = state["humidity"]
     lcd.print("In: {}C  {}%".format(
         "--" if t is None else t,
         "--" if h is None else h), 10, 110, COLOR_WHITE)
+
     aq = state["air_quality_label"]
     lcd.print("Air: {}".format(aq), 10, 140, air_color(aq))
+
+    # Session status — state only, no elapsed time
+    # Elapsed time is owned and displayed by Device B
     if state["session_active"]:
-        label = "Paused" if state["session_paused"] else format_seconds(state["session_work_sec"])
-        color = COLOR_WARN if state["session_paused"] else COLOR_GOOD
+        if state["session_paused"]:
+            label = "Paused"
+            color = COLOR_WARN
+        else:
+            label = "Working"
+            color = COLOR_GOOD
     else:
-        label = "No session"; color = COLOR_GREY
+        label = "No session"
+        color = COLOR_GREY
     lcd.print("Session: {}".format(label), 10, 170, color)
+
     lcd.font(lcd.FONT_Default)
     lcd.print("[WiFi]",     10,  220, COLOR_ACCENT)
     lcd.print("[Voice]",    120, 220, COLOR_WARN)
     lcd.print("[Forecast]", 225, 220, wcol)
 
 # ============================================================
-# DISPLAY — ANSWER (screen 2)
+# DISPLAY — ANSWER SCREEN (screen 2)
 # ============================================================
+
 def draw_answer_screen():
+    """
+    Displays the AI assistant's answer after a voice query.
+    Word-wraps the answer text into 8 lines of 48 chars max.
+    """
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print("AI Answer", 100, 8, COLOR_WARN)
@@ -675,11 +756,16 @@ def draw_answer_screen():
     lcd.print("[Back]", 240, 220, COLOR_GREY)
 
 # ============================================================
-# DISPLAY — FORECAST (screen 3)
-# Layout per row (38px):
-#   strip(4px) | day name | [icon 22px] | temp + condition (2 lines)
+# DISPLAY — FORECAST SCREEN (screen 3)
+# 5-column layout: 64px per column, icons + temps + condition
 # ============================================================
+
 def draw_forecast_screen():
+    """
+    5-day forecast display.
+    Each column shows: day name, weather icon, max/min temp, condition word.
+    Icons are drawn with LCD primitives — no image files needed.
+    """
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print("5-Day Forecast", 55, 6, COLOR_WHITE)
@@ -694,12 +780,11 @@ def draw_forecast_screen():
         return
 
     td    = today_str()
-    col_w = 64   # 5 columns x 64px = 320px
+    col_w = 64
 
     for i, day in enumerate(forecast[:5]):
-        cx   = col_w * i + 32   # column center x: 32, 96, 160, 224, 288
-        x0   = col_w * i        # column left edge
-
+        cx   = col_w * i + 32
+        x0   = col_w * i
         date = day.get("date", "")
         name = date_to_dayname(date, td)
         tmin = int(round(day.get("temp_min", 0)))
@@ -707,33 +792,24 @@ def draw_forecast_screen():
         cond = day.get("condition", "N/A")
         col  = condition_color(cond)
 
-        # Vertical separator (skip first column)
         if i > 0:
             lcd.line(x0, 29, x0, 205, COLOR_DIVIDER)
-
-        # Top color accent bar
         x_bar = x0 + (1 if i > 0 else 0)
         lcd.fillRect(x_bar, 29, col_w - (1 if i > 0 else 0), 5, col)
 
-        # Day name (3 chars, centered)
         lcd.font(lcd.FONT_Default)
         name_s = name[:3]
         lcd.print(name_s, cx - len(name_s) * 4, 42, col)
-
-        # Weather icon centered in column
         draw_weather_icon(cx, 88, cond)
 
-        # Max temperature (larger font)
         lcd.font(lcd.FONT_DejaVu18)
         tmax_s = "{}°".format(tmax)
         lcd.print(tmax_s, cx - len(tmax_s) * 6, 130, COLOR_WHITE)
 
-        # Min temperature (smaller font, grey)
         lcd.font(lcd.FONT_Default)
         tmin_s = "{}°".format(tmin)
         lcd.print(tmin_s, cx - len(tmin_s) * 4, 155, COLOR_GREY)
 
-        # Condition first word (max 7 chars)
         cond_s = cond.split()[0][:7]
         lcd.print(cond_s, cx - len(cond_s) * 4, 172, COLOR_GREY)
 
@@ -742,8 +818,10 @@ def draw_forecast_screen():
     lcd.print("[Back]", 10, 215, COLOR_GREY)
 
 # ============================================================
-# DISPLAY — WIFI (screen 4) — helpers
+# DISPLAY — WIFI SCREEN (screen 4)
+# Two network cards + bottom button hints
 # ============================================================
+
 def _wifi_cx(text, char_w):
     return max(0, (320 - len(text) * char_w) // 2)
 
@@ -751,6 +829,7 @@ def _wifi_rx(text, char_w, margin=10):
     return max(0, 320 - len(text) * char_w - margin)
 
 def _wifi_split(ssid, max_chars=11):
+    """Splits long SSIDs into two lines for the card display."""
     if len(ssid) <= max_chars:
         return [ssid, ""]
     idx = ssid.rfind(" ", 0, max_chars)
@@ -759,6 +838,10 @@ def _wifi_split(ssid, max_chars=11):
     return [ssid[:max_chars], ssid[max_chars:]]
 
 def _wifi_draw_card(x, y, w, h, ssid):
+    """
+    Draws one network card. Active = green tinted background.
+    Uses wlan.config("essid") to detect the currently connected network.
+    """
     try:    is_active = wlan.isconnected() and wlan.config("essid") == ssid
     except: is_active = False
     bg = COLOR_CARD_ACTIVE if is_active else COLOR_CARD_INACTIVE
@@ -780,10 +863,11 @@ def _wifi_draw_card(x, y, w, h, ssid):
         lcd.print("Tap to",   x + 7, y + 68, COLOR_GREY_DIM)
         lcd.print("connect",  x + 7, y + 88, COLOR_GREY_DIM)
 
-# ============================================================
-# DISPLAY — WIFI (screen 4)
-# ============================================================
 def draw_wifi_screen():
+    """
+    WiFi selection screen — same card layout as Device B.
+    BtnA → KNOWN_NETWORKS[0], BtnB → cancel, BtnC → KNOWN_NETWORKS[1]
+    """
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
     title = "WiFi Selection"
@@ -793,17 +877,24 @@ def draw_wifi_screen():
     _wifi_draw_card(168, 40, 146, 138, KNOWN_NETWORKS[1][0])
     lcd.line(0, 188, 320, 188, COLOR_DIVIDER)
     lcd.font(lcd.FONT_DejaVu18)
-    lcd.print("< Connect", 10,                         205, COLOR_ACCENT)
-    lcd.print("Cancel",    _wifi_cx("Cancel", 11),     205, COLOR_GREY)
-    lcd.print("Connect >", _wifi_rx("Connect >", 11),  205, COLOR_ACCENT)
+    lcd.print("< Connect", 10,                        205, COLOR_ACCENT)
+    lcd.print("Cancel",    _wifi_cx("Cancel", 11),    205, COLOR_GREY)
+    lcd.print("Connect >", _wifi_rx("Connect >", 11), 205, COLOR_ACCENT)
 
 # ============================================================
 # BUTTONS
 # ============================================================
-def handle_buttons():
-    global current_screen, wifi_sel_idx
 
-    if current_screen == 4:        # WiFi
+def handle_buttons():
+    """
+    Screen 4 (WiFi): BtnA=net0, BtnB=cancel, BtnC=net1
+    Screen 3 (Forecast): BtnA=back
+    Screen 2 (Answer): BtnA=back
+    Screen 0 (Main): BtnA=WiFi, BtnB=Voice, BtnC=Forecast
+    """
+    global current_screen
+
+    if current_screen == 4:
         if btnA.wasPressed():
             connect_to_network(0)
             current_screen = 0
@@ -813,34 +904,44 @@ def handle_buttons():
             connect_to_network(1)
             current_screen = 0
 
-    elif current_screen == 3:      # Forecast
+    elif current_screen == 3:
         if btnA.wasPressed():
             current_screen = 0
 
-    elif current_screen == 2:      # Answer
+    elif current_screen == 2:
         if btnA.wasPressed():
             current_screen = 0
 
-    else:                           # Main (0)
+    else:
         if btnA.wasPressed():
-            current_screen = 4     # → WiFi
+            current_screen = 4
             draw_wifi_screen()
         if btnB.wasPressed():
             voice_flow()
         if btnC.wasPressed():
-            current_screen = 3     # → Forecast
+            current_screen = 3
             draw_forecast_screen()
 
 # ============================================================
 # BOOT
 # ============================================================
+
 def boot():
+    """
+    Startup sequence:
+    1. Boot splash
+    2. SGP30 warm-up (15s — sensor needs time to stabilise)
+    3. WiFi connection
+    4. NTP time sync (3 retries)
+    5. Sync last known sensor values from BigQuery
+    6. Fetch weather and current session state
+    7. Read sensors + update LEDs + draw main screen
+    """
     show_msg("Booting...")
     time.sleep(1)
     show_msg("Warming up\nair sensor...")
     time.sleep(15)
     connect_wifi()
-    # NTP sync with 3 retries — silent fail is worse than slow boot
     for _ntp in range(3):
         try:
             ntptime.settime()
@@ -861,42 +962,71 @@ def boot():
 # ============================================================
 # MAIN LOOP
 # ============================================================
+
 def loop():
+    """
+    Main event loop — runs forever at ~1s per iteration.
+    All intervals are checked against time.time() so they fire
+    independently regardless of how long individual tasks take.
+    """
     global last_motion_time
-    last_sensor = 0; last_bq      = 0; last_weather = 0
-    last_session= 0; last_clock  = 0; last_draw    = 0; last_ntp = 0
+    last_sensor  = 0; last_bq      = 0; last_weather = 0
+    last_session = 0; last_clock   = 0; last_draw    = 0; last_ntp = 0
+
     while True:
         now = time.time()
+
+        # Clock update — every second
         if now - last_clock >= 1:
             state["time_str"], state["date_str"] = get_time_strings()
             last_clock = now
+
+        # PIR motion — polled every iteration (fast, no network)
         try:
             state["motion"] = bool(pir.value())
             if state["motion"]:
                 last_motion_time = now
         except: pass
-        # Re-sync NTP every hour to stay accurate
+
+        # NTP re-sync — every hour
         if now - last_ntp >= 3600:
             try: ntptime.settime()
             except: pass
             last_ntp = now
+
+        # Sensors — every SENSOR_INTERVAL (10s)
         if now - last_sensor >= SENSOR_INTERVAL:
             read_sensors(); update_leds(); last_sensor = now
+
+        # BigQuery post — every BQ_INTERVAL (30s)
+        # Offset from SENSOR_INTERVAL to avoid simultaneous requests
         if now - last_bq >= BQ_INTERVAL:
             post_indoor(); last_bq = now
+
+        # Weather — every WEATHER_INTERVAL (30 min)
         if now - last_weather >= WEATHER_INTERVAL:
             fetch_weather(); last_weather = now
-        if now - last_session >= 5:
+
+        # Session sync — every SESSION_INTERVAL (15s)
+        # Reduced from 5s to avoid competing with Device B's 10s polls
+        if now - last_session >= SESSION_INTERVAL:
             fetch_session(); last_session = now
+
         check_alerts()
         handle_buttons()
+
+        # Screen redraw — every DRAW_INTERVAL (5s)
         if now - last_draw >= DRAW_INTERVAL:
             if   current_screen == 0: draw_main_screen()
             elif current_screen == 3: draw_forecast_screen()
             elif current_screen == 4: draw_wifi_screen()
             last_draw = now
+
         gc.collect()
         time.sleep(1)
 
+# ============================================================
+# ENTRY POINT
+# ============================================================
 boot()
 loop()
