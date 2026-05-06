@@ -59,18 +59,22 @@ except Exception as e:
 # GLOBAL STATE
 # ============================================================
 state = {
-    "session_active":  False,
-    "session_paused":  False,
-    "work_seconds":    0,        # Incremented +1 per compensated tick
-    "active_card_id":  None,     # Restored from server on boot
-    "wifi_connected":  False,
-    "wifi_ssid":       "",
-    "screen":          "main",
-    "last_raw_card":   None,
-    "last_btn_ms":     0,
-    # Guards against server resurrecting a locally-ended session
-    # when /session/end returns 500 (e.g. app.py not yet deployed)
-    "session_end_ms":  0,
+    "session_active":   False,
+    "session_paused":   False,
+    "work_seconds":     0,       # Incremented +1 per compensated tick
+    "active_card_id":   None,    # Restored from server on boot
+    "wifi_connected":   False,
+    "wifi_ssid":        "",
+    "screen":           "main",
+    "last_raw_card":    None,
+    "last_btn_ms":      0,
+    # FIX 3 — timestamp when session was locally STARTED.
+    # Prevents fetch_session() from killing a brand-new session if
+    # Cloud Run returns active=False in the first 15s (cold start race).
+    "session_start_ms": 0,
+    # Timestamp when session was locally ENDED.
+    # Prevents fetch_session() from resurrecting a session after /session/end.
+    "session_end_ms":   0,
 }
 
 _last_drawn = {
@@ -381,26 +385,34 @@ def handle_rfid(card_id):
     Tap logic:
       No active session → start one.
       Active session + same card → end it.
-      Active session + different card → error screen.
+      Active session + different card → error screen, no change.
 
     Fallback: if active_card_id is None (not restored after reboot),
     the first card tap claims ownership so the user is never stuck.
 
-    GUARD 1 — draw idle screen BEFORE the HTTP POST so the user
-    gets instant visual feedback instead of waiting for the network.
+    FIX 1 — For session START: local state is updated and screen drawn
+    BEFORE the HTTP POST. The user sees the session screen immediately,
+    without waiting for the network (same pattern as session end).
 
-    GUARD 2 — session_end_ms is recorded so fetch_session() can
-    ignore the server's stale active=True for 15 seconds after
-    a local session end, preventing ghost session resurrection.
+    For session END: same pattern — idle screen drawn before POST.
+    session_end_ms is recorded so fetch_session() ignores any stale
+    active=True from the server for 15 seconds.
     """
     if not state["session_active"]:
+        # --- START ---
+        # Update local state first for instant visual feedback
+        state["session_active"]   = True
+        state["session_paused"]   = False
+        state["work_seconds"]     = 0
+        state["active_card_id"]   = card_id
+        # FIX 3 — record start time for fetch_session() cold-start guard
+        state["session_start_ms"] = time.ticks_ms()
+        draw_session_screen()          # Immediate feedback — before HTTP
         post_session_event("start", card_id)
-        state["session_active"] = True
-        state["session_paused"] = False
-        state["work_seconds"]   = 0
-        state["active_card_id"] = card_id
         print("[RFID] Session started:", card_id)
+
     else:
+        # --- END (or wrong card) ---
         if state["active_card_id"] is None:
             # Reboot without card info from server — accept first card
             print("[RFID] active_card_id unknown — claiming:", card_id)
@@ -411,16 +423,13 @@ def handle_rfid(card_id):
             draw_error_screen("Wrong card!", duration=3)
             return
 
-        # Update local state immediately — before the HTTP call
-        state["session_active"] = False
-        state["session_paused"] = False
-        state["active_card_id"] = None
-        state["work_seconds"]   = 0
-        # GUARD 2: timestamp the local end for fetch_session() cooldown
-        state["session_end_ms"] = time.ticks_ms()
-        # GUARD 1: show idle immediately — user sees response before HTTP
-        draw_idle_screen()
-        # HTTP POST happens after visual update
+        # Same card → end session
+        state["session_active"]  = False
+        state["session_paused"]  = False
+        state["active_card_id"]  = None
+        state["work_seconds"]    = 0
+        state["session_end_ms"]  = time.ticks_ms()
+        draw_idle_screen()             # Immediate feedback — before HTTP
         post_session_event("end", card_id)
         print("[RFID] Session ended:", card_id)
 
@@ -446,6 +455,10 @@ def handle_buttons():
     Main screen:
       BtnA (left)   → pause / resume
       BtnC (right)  → open WiFi screen
+
+    FIX 2 — For PAUSE and RESUME: local state is updated and screen
+    drawn BEFORE the HTTP POST. The button feels instantaneous to
+    the user instead of lagging behind the network response.
     """
     if state["screen"] == "wifi":
         if btnA.wasPressed() and _btn_allowed():
@@ -467,14 +480,17 @@ def handle_buttons():
         if not state["session_active"]:
             return
         if state["session_paused"]:
-            post_session_event("resume", None)
+            # FIX 2 — update local state and draw BEFORE the POST
             state["session_paused"] = False
+            draw_session_screen()
+            post_session_event("resume", None)
             print("[BTN] Resumed")
         else:
-            post_session_event("pause", None)
+            # FIX 2 — update local state and draw BEFORE the POST
             state["session_paused"] = True
+            draw_session_screen()
+            post_session_event("pause", None)
             print("[BTN] Paused")
-        draw_session_screen()
 
     if btnC.wasPressed() and _btn_allowed():
         state["screen"] = "wifi"
@@ -488,8 +504,9 @@ def post_session_event(event_type, card_id):
     """
     POSTs a session lifecycle event to the middleware.
     No timeout parameter — not supported in MicroPython urequests.
-    Errors are caught and logged without crashing the device.
-    gc.collect() called after every network op to free memory.
+    Errors are caught and logged — device state is already updated
+    before this call so a network failure does not block the UI.
+    gc.collect() called after every network op to reclaim memory.
     """
     payload = {"event": event_type, "card_id": card_id}
     try:
@@ -511,12 +528,18 @@ def fetch_session(boot_sync=False):
     Always syncs: session_active
     Boot only:    session_paused, work_seconds, active_card_id
     Never synced after boot: session_paused, work_seconds
-      → device is sole source of truth for those values
+      → device is sole source of truth for those values after boot.
 
-    GUARD 2 — if the session was locally ended less than 15 seconds ago,
-    we ignore the server returning active=True. This prevents a ghost
-    session from reappearing when /session/end returned a 500 error
-    (e.g. app.py not yet deployed with the correct bq function calls).
+    Two cooldown guards protect against race conditions:
+
+    session_end_ms guard: if we locally ended the session less than 15s
+    ago, ignore the server saying active=True. Prevents ghost sessions
+    when /session/end is slow or the server hasn't processed it yet.
+
+    FIX 3 — session_start_ms guard: if we locally started a session
+    less than 15s ago, ignore the server saying active=False. Prevents
+    a Cloud Run cold instance from killing a brand-new session before
+    the server has processed the /session/start POST.
     """
     try:
         r = urequests.get(MIDDLEWARE_URL + "/session/current")
@@ -524,13 +547,21 @@ def fetch_session(boot_sync=False):
             data = ujson.loads(r.text)
 
             server_active = data.get("active", False)
+            now_ms        = time.ticks_ms()
 
-            # GUARD 2: cooldown after local session end
-            if not boot_sync and not state["session_active"] and server_active:
-                ms_since_end = time.ticks_diff(time.ticks_ms(), state["session_end_ms"])
-                if ms_since_end < 15000:
-                    print("[SESSION] Ignoring server active=True — end cooldown active")
-                    server_active = False
+            if not boot_sync:
+                # Guard: we just ended the session locally — ignore stale active=True
+                if not state["session_active"] and server_active:
+                    if time.ticks_diff(now_ms, state["session_end_ms"]) < 15000:
+                        print("[SESSION] Ignoring server active=True — end cooldown")
+                        server_active = False
+
+                # FIX 3 — Guard: we just started the session locally
+                # ignore server active=False from a cold/different instance
+                if state["session_active"] and not server_active:
+                    if time.ticks_diff(now_ms, state["session_start_ms"]) < 15000:
+                        print("[SESSION] Ignoring server active=False — start cooldown")
+                        server_active = True
 
             prev_active             = state["session_active"]
             state["session_active"] = server_active
@@ -543,11 +574,11 @@ def fetch_session(boot_sync=False):
                 print("[SESSION] Server ended session — local reset")
 
             if boot_sync:
-                state["session_paused"] = data.get("paused", False)
-                state["active_card_id"] = (
+                state["session_paused"]   = data.get("paused", False)
+                state["active_card_id"]   = (
                     data.get("card_id") or data.get("rfid_card_id")
                 )
-                state["work_seconds"]   = int(data.get("work_seconds", 0))
+                state["work_seconds"]     = int(data.get("work_seconds", 0))
                 print("[SESSION] Boot sync — active:", state["session_active"],
                       "paused:", state["session_paused"],
                       "card:", state["active_card_id"],
@@ -569,6 +600,8 @@ def boot():
     2. WiFi connection
     3. Full session sync from server (boot_sync=True)
        Restores: active, paused, work_seconds, active_card_id
+       This satisfies the requirement: if the device reboots during
+       a session, it reconnects and displays the session as if nothing happened.
     4. Draw correct initial screen
     """
     _draw_boot_msg("Booting...")
@@ -587,15 +620,14 @@ def loop():
     """
     1-second tick loop with compensated sleep.
 
-    Each iteration measures its own duration and sleeps only the
-    remaining time to reach 1000ms total. This ensures the timer
-    increments smoothly at exactly 1 second regardless of how long
-    fetch_session() HTTP calls take (normally 300-1500ms).
+    Each iteration measures its own execution time and sleeps only
+    the remaining time to reach 1000ms total. This gives a smooth
+    1-second timer regardless of how long HTTP calls take.
 
     Examples:
-      Loop body = 50ms   → sleep 950ms → total ~1000ms
-      Loop body = 800ms  → sleep 200ms → total ~1000ms
-      Loop body = 1200ms → sleep 0ms   → this tick is slightly late (rare)
+      Loop body = 50ms   → sleep 950ms → total ~1000ms  (normal)
+      Loop body = 800ms  → sleep 200ms → total ~1000ms  (during HTTP)
+      Loop body = 1200ms → sleep 0ms   → slightly late  (rare, slow network)
     """
     last_poll_ms = time.ticks_ms()
     last_wifi_ms = time.ticks_ms()
