@@ -1,7 +1,6 @@
 # middleware/bigquery_client.py
 # Handles all BigQuery read and write operations.
 # All other middleware files import from here — never directly from google.cloud.bigquery.
-# Assigned to: Pablo
 
 import os
 import json

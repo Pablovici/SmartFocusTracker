@@ -2,7 +2,6 @@
 # Flask API — main entry point for the middleware layer.
 # Receives data from M5Stack devices and serves data to Streamlit dashboard.
 # All BigQuery operations are delegated to bigquery_client.py.
-# Assigned to: Pablo
 
 import os
 import uuid
