@@ -23,6 +23,12 @@ SESSION_POLL_MS = 10000   # Server sync every 10s
 WIFI_CHECK_MS   = 30000   # WiFi health check every 30s
 BTN_DEBOUNCE_MS = 500     # Minimum ms between button events
 
+# How many consecutive active=False server responses required before
+# Device B trusts the server and resets its local session state.
+# A single bad response (server overloaded, partial response, brief restart)
+# is ignored. Three in a row means the session is genuinely over.
+SESSION_FALSE_THRESHOLD = 3
+
 # ============================================================
 # DISPLAY CONSTANTS
 # ============================================================
@@ -59,22 +65,22 @@ except Exception as e:
 # GLOBAL STATE
 # ============================================================
 state = {
-    "session_active":   False,
-    "session_paused":   False,
-    "work_seconds":     0,       # Incremented +1 per compensated tick
-    "active_card_id":   None,    # Restored from server on boot
-    "wifi_connected":   False,
-    "wifi_ssid":        "",
-    "screen":           "main",
-    "last_raw_card":    None,
-    "last_btn_ms":      0,
-    # FIX 3 — timestamp when session was locally STARTED.
-    # Prevents fetch_session() from killing a brand-new session if
-    # Cloud Run returns active=False in the first 15s (cold start race).
-    "session_start_ms": 0,
-    # Timestamp when session was locally ENDED.
-    # Prevents fetch_session() from resurrecting a session after /session/end.
-    "session_end_ms":   0,
+    "session_active":     False,
+    "session_paused":     False,
+    "work_seconds":       0,
+    "active_card_id":     None,
+    "wifi_connected":     False,
+    "wifi_ssid":          "",
+    "screen":             "main",
+    "last_raw_card":      None,
+    "last_btn_ms":        0,
+    "session_start_ms":   0,
+    "session_end_ms":     0,
+    # KEY FIX — counts consecutive active=False responses from the server.
+    # Device B only resets when this reaches SESSION_FALSE_THRESHOLD (3).
+    # A single bad/partial server response is ignored — session stays alive.
+    # Counter resets to 0 immediately when server confirms active=True.
+    "session_false_count": 0,
 }
 
 _last_drawn = {
@@ -123,8 +129,9 @@ def connect_wifi():
 
 def check_wifi_alive():
     """
-    Silent background reconnect check — does not touch the screen.
+    Silent background reconnect check.
     Called every WIFI_CHECK_MS from the main loop.
+    Does not touch the screen.
     """
     wlan = network.WLAN(network.STA_IF)
     if wlan.isconnected():
@@ -164,9 +171,8 @@ def _rx(text, char_w, margin=10):
 
 def _split_ssid(ssid, max_chars=11):
     """
-    Splits a long SSID into two lines to fit inside a narrow WiFi card.
+    Splits a long SSID into two lines for WiFi card display.
     Breaks at the last space before max_chars.
-    Example: "iPhone de Amir" -> ["iPhone de", "Amir"]
     """
     if len(ssid) <= max_chars:
         return [ssid, ""]
@@ -182,7 +188,7 @@ def _draw_header():
     lcd.line(0, 32, SCREEN_W, 32, COLOR_DIVIDER)
 
 def _draw_time_zone(work_str):
-    """Partial redraw — erases only the time zone rectangle to avoid ghosting."""
+    """Partial redraw — erases only the time zone rectangle."""
     lcd.fillRect(0, 134, SCREEN_W, 42, COLOR_BG)
     lcd.font(lcd.FONT_DejaVu24)
     lcd.print(work_str, _cx(work_str, 15, -4), 140, COLOR_WHITE)
@@ -195,8 +201,8 @@ def _draw_bottom_bar(pause_label):
     """
     Session screen bottom bar:
       y=188: divider
-      y=196: TAP TO END  (centred — constant position)
-      y=218: PAUSE/RESUME (left, BtnA) | WiFi OK/No WiFi (right, BtnC)
+      y=196: TAP TO END  (centred)
+      y=218: PAUSE/RESUME (left, BtnA) | WiFi status (right, BtnC)
     """
     lcd.line(0, 188, SCREEN_W, 188, COLOR_DIVIDER)
     lcd.font(lcd.FONT_DejaVu18)
@@ -208,10 +214,7 @@ def _draw_bottom_bar(pause_label):
     lcd.print(wifi_text, _rx(wifi_text, 11, 10), 218, wifi_color)
 
 def _draw_idle_bottom():
-    """
-    Idle screen bottom bar.
-    WiFi status on the right at BtnC physical position.
-    """
+    """Idle screen bottom bar — WiFi status on the right (BtnC)."""
     lcd.line(0, 188, SCREEN_W, 188, COLOR_DIVIDER)
     lcd.font(lcd.FONT_DejaVu18)
     wifi_text  = "WiFi OK" if state["wifi_connected"] else "No WiFi"
@@ -224,29 +227,23 @@ def _draw_idle_bottom():
 
 def _draw_wifi_card(x, y, w, h, ssid):
     """
-    Draws one network card for the WiFi selection screen.
-    Active network: green-tinted background + green top border.
-    Inactive network: dark background + dim border.
-    SSID split into two lines via _split_ssid() if too long.
-    ASCII-only labels — MicroPython bitmap fonts may not support Unicode.
+    One network card. Active = green-tinted bg + green border.
+    SSID split to 2 lines if needed. ASCII labels only.
     """
     is_active = state["wifi_connected"] and state["wifi_ssid"] == ssid
     bg        = COLOR_CARD_ACTIVE if is_active else COLOR_CARD_INACTIVE
     lcd.fillRect(x, y, w, h, bg)
-
     top_color = COLOR_GOOD if is_active else COLOR_DIVIDER
     lcd.line(x,     y,     x + w, y,     top_color)
     lcd.line(x,     y,     x,     y + h, COLOR_DIVIDER)
     lcd.line(x + w, y,     x + w, y + h, COLOR_DIVIDER)
     lcd.line(x,     y + h, x + w, y + h, COLOR_DIVIDER)
-
     lines      = _split_ssid(ssid, 11)
     name_color = COLOR_WHITE if is_active else COLOR_GREY_SOFT
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print(lines[0], x + 7, y + 10, name_color)
     if lines[1]:
         lcd.print(lines[1], x + 7, y + 30, name_color)
-
     if is_active:
         lcd.print(">> Active", x + 7, y + 72, COLOR_GOOD)
     else:
@@ -255,22 +252,17 @@ def _draw_wifi_card(x, y, w, h, ssid):
 
 def draw_wifi_screen():
     """
-    WiFi selection screen with two network cards side by side.
-    Button labels use directional arrows — no technical "BtnA/BtnC" jargon.
-
-    BtnA (left)   → "< Connect" → KNOWN_NETWORKS[0]
-    BtnB (middle) → "Cancel"    → back without changing
-    BtnC (right)  → "Connect >" → KNOWN_NETWORKS[1]
+    Two network cards side by side.
+    BtnA=left card, BtnB=cancel, BtnC=right card.
+    Arrow labels — no technical button names shown.
     """
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
     title = "WiFi Selection"
     lcd.print(title, _cx(title, 11, -4), 8, COLOR_ACCENT)
     lcd.line(0, 30, SCREEN_W, 30, COLOR_DIVIDER)
-
     _draw_wifi_card(6,   40, 146, 138, KNOWN_NETWORKS[0][0])
     _draw_wifi_card(168, 40, 146, 138, KNOWN_NETWORKS[1][0])
-
     lcd.line(0, 188, SCREEN_W, 188, COLOR_DIVIDER)
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print("< Connect", 10,                        205, COLOR_ACCENT)
@@ -307,15 +299,12 @@ def draw_session_screen():
     _update_last_drawn()
 
 def draw_time_only():
-    """Lightweight partial redraw — only the time zone rectangle."""
+    """Lightweight partial redraw — only the time zone."""
     _draw_time_zone(format_seconds(state["work_seconds"]))
     _last_drawn["work_seconds"] = state["work_seconds"]
 
 def draw_error_screen(message, duration=3):
-    """
-    Large centred error message with subtitle hint.
-    char_w=23 is the empirically correct value for DejaVu40 on M5Stack Core2.
-    """
+    """Large centred error message. char_w=23 correct for DejaVu40."""
     lcd.clear(COLOR_BG)
     _draw_header()
     lcd.font(lcd.FONT_DejaVu40)
@@ -332,7 +321,7 @@ def draw_error_screen(message, duration=3):
 # ============================================================
 
 def format_seconds(seconds):
-    """Human-readable elapsed time. Integer arithmetic only — no floats."""
+    """Human-readable elapsed time. Integer arithmetic only."""
     if not seconds: return "0s"
     s = int(seconds) % 60
     m = int(seconds) // 60
@@ -364,9 +353,8 @@ def _time_changed():
 
 def read_rfid():
     """
-    Returns a UID only on a fresh tap (card was absent before).
-    Resets last_raw_card to None when card is removed so the
-    next tap fires correctly.
+    Returns a UID only on a fresh tap.
+    Resets last_raw_card to None when card is removed.
     """
     try:
         if rfid.isCardOn():
@@ -383,38 +371,27 @@ def read_rfid():
 def handle_rfid(card_id):
     """
     Tap logic:
-      No active session → start one.
-      Active session + same card → end it.
-      Active session + different card → error screen, no change.
+      No active session   → start one (draw before POST for instant feedback)
+      Active + same card  → end it    (draw before POST for instant feedback)
+      Active + other card → error screen, no change
 
-    Fallback: if active_card_id is None (not restored after reboot),
-    the first card tap claims ownership so the user is never stuck.
-
-    FIX 1 — For session START: local state is updated and screen drawn
-    BEFORE the HTTP POST. The user sees the session screen immediately,
-    without waiting for the network (same pattern as session end).
-
-    For session END: same pattern — idle screen drawn before POST.
-    session_end_ms is recorded so fetch_session() ignores any stale
-    active=True from the server for 15 seconds.
+    Fallback: if active_card_id is None after reboot, accept any card
+    so the user is never stuck with an un-endable session.
     """
     if not state["session_active"]:
-        # --- START ---
-        # Update local state first for instant visual feedback
-        state["session_active"]   = True
-        state["session_paused"]   = False
-        state["work_seconds"]     = 0
-        state["active_card_id"]   = card_id
-        # FIX 3 — record start time for fetch_session() cold-start guard
-        state["session_start_ms"] = time.ticks_ms()
-        draw_session_screen()          # Immediate feedback — before HTTP
+        # START — update local state first, draw, then POST
+        state["session_active"]    = True
+        state["session_paused"]    = False
+        state["work_seconds"]      = 0
+        state["active_card_id"]    = card_id
+        state["session_start_ms"]  = time.ticks_ms()
+        state["session_false_count"] = 0   # Reset false counter on new session
+        draw_session_screen()
         post_session_event("start", card_id)
         print("[RFID] Session started:", card_id)
 
     else:
-        # --- END (or wrong card) ---
         if state["active_card_id"] is None:
-            # Reboot without card info from server — accept first card
             print("[RFID] active_card_id unknown — claiming:", card_id)
             state["active_card_id"] = card_id
 
@@ -423,13 +400,14 @@ def handle_rfid(card_id):
             draw_error_screen("Wrong card!", duration=3)
             return
 
-        # Same card → end session
-        state["session_active"]  = False
-        state["session_paused"]  = False
-        state["active_card_id"]  = None
-        state["work_seconds"]    = 0
-        state["session_end_ms"]  = time.ticks_ms()
-        draw_idle_screen()             # Immediate feedback — before HTTP
+        # END — update local state first, draw, then POST
+        state["session_active"]      = False
+        state["session_paused"]      = False
+        state["active_card_id"]      = None
+        state["work_seconds"]        = 0
+        state["session_end_ms"]      = time.ticks_ms()
+        state["session_false_count"] = 0
+        draw_idle_screen()
         post_session_event("end", card_id)
         print("[RFID] Session ended:", card_id)
 
@@ -438,7 +416,7 @@ def handle_rfid(card_id):
 # ============================================================
 
 def _btn_allowed():
-    """Debounce guard — returns True only if BTN_DEBOUNCE_MS has elapsed."""
+    """Debounce guard — minimum BTN_DEBOUNCE_MS between events."""
     now = time.ticks_ms()
     if time.ticks_diff(now, state["last_btn_ms"]) < BTN_DEBOUNCE_MS:
         return False
@@ -447,18 +425,9 @@ def _btn_allowed():
 
 def handle_buttons():
     """
-    WiFi screen:
-      BtnA (left)   → connect to KNOWN_NETWORKS[0]
-      BtnB (middle) → cancel / back
-      BtnC (right)  → connect to KNOWN_NETWORKS[1]
-
-    Main screen:
-      BtnA (left)   → pause / resume
-      BtnC (right)  → open WiFi screen
-
-    FIX 2 — For PAUSE and RESUME: local state is updated and screen
-    drawn BEFORE the HTTP POST. The button feels instantaneous to
-    the user instead of lagging behind the network response.
+    WiFi screen: BtnA=net0, BtnB=cancel, BtnC=net1
+    Main screen: BtnA=pause/resume, BtnC=open WiFi screen
+    State updated and screen drawn BEFORE HTTP POST for instant feedback.
     """
     if state["screen"] == "wifi":
         if btnA.wasPressed() and _btn_allowed():
@@ -480,13 +449,11 @@ def handle_buttons():
         if not state["session_active"]:
             return
         if state["session_paused"]:
-            # FIX 2 — update local state and draw BEFORE the POST
             state["session_paused"] = False
             draw_session_screen()
             post_session_event("resume", None)
             print("[BTN] Resumed")
         else:
-            # FIX 2 — update local state and draw BEFORE the POST
             state["session_paused"] = True
             draw_session_screen()
             post_session_event("pause", None)
@@ -503,10 +470,8 @@ def handle_buttons():
 def post_session_event(event_type, card_id):
     """
     POSTs a session lifecycle event to the middleware.
-    No timeout parameter — not supported in MicroPython urequests.
-    Errors are caught and logged — device state is already updated
-    before this call so a network failure does not block the UI.
-    gc.collect() called after every network op to reclaim memory.
+    No timeout — not supported in MicroPython urequests.
+    Errors are caught — device state is already updated before this call.
     """
     payload = {"event": event_type, "card_id": card_id}
     try:
@@ -525,21 +490,23 @@ def fetch_session(boot_sync=False):
     """
     GETs /session/current from middleware.
 
-    Always syncs: session_active
-    Boot only:    session_paused, work_seconds, active_card_id
-    Never synced after boot: session_paused, work_seconds
-      → device is sole source of truth for those values after boot.
+    KEY FIX — session_false_count guard:
+    When the server returns active=False while Device B has an active
+    session, we do NOT immediately reset. We increment a counter and
+    only reset when the counter reaches SESSION_FALSE_THRESHOLD (3).
 
-    Two cooldown guards protect against race conditions:
+    Why: Device A polls every 5s and sometimes causes Flask to be
+    briefly busy (weather fetch, BigQuery write, TTS call). During
+    that window, Device B can receive a corrupted/partial response
+    that parses as active=False. This guard absorbs those single
+    bad responses without affecting the user experience.
 
-    session_end_ms guard: if we locally ended the session less than 15s
-    ago, ignore the server saying active=True. Prevents ghost sessions
-    when /session/end is slow or the server hasn't processed it yet.
+    When the server confirms active=True, the counter resets to 0
+    immediately and the session_start_ms guard is refreshed.
 
-    FIX 3 — session_start_ms guard: if we locally started a session
-    less than 15s ago, ignore the server saying active=False. Prevents
-    a Cloud Run cold instance from killing a brand-new session before
-    the server has processed the /session/start POST.
+    Standard cooldown guards also apply:
+    - session_end_ms:   ignore active=True for 15s after local end
+    - session_start_ms: ignore active=False for 15s after local start
     """
     try:
         r = urequests.get(MIDDLEWARE_URL + "/session/current")
@@ -550,35 +517,52 @@ def fetch_session(boot_sync=False):
             now_ms        = time.ticks_ms()
 
             if not boot_sync:
-                # Guard: we just ended the session locally — ignore stale active=True
+                # Guard 1 — ignore active=True shortly after local end
                 if not state["session_active"] and server_active:
                     if time.ticks_diff(now_ms, state["session_end_ms"]) < 15000:
-                        print("[SESSION] Ignoring server active=True — end cooldown")
+                        print("[SESSION] Ignoring active=True — end cooldown")
                         server_active = False
 
-                # FIX 3 — Guard: we just started the session locally
-                # ignore server active=False from a cold/different instance
+                # Guard 2 — ignore active=False shortly after local start
                 if state["session_active"] and not server_active:
                     if time.ticks_diff(now_ms, state["session_start_ms"]) < 15000:
-                        print("[SESSION] Ignoring server active=False — start cooldown")
+                        print("[SESSION] Ignoring active=False — start cooldown")
                         server_active = True
+
+                # KEY FIX — consecutive false count guard
+                if state["session_active"] and not server_active:
+                    state["session_false_count"] += 1
+                    print("[SESSION] active=False count:", state["session_false_count"],
+                          "/", SESSION_FALSE_THRESHOLD)
+                    if state["session_false_count"] < SESSION_FALSE_THRESHOLD:
+                        # Not enough consecutive false responses — keep session alive
+                        server_active = True
+                else:
+                    # Server says active=True — reset counter and refresh start guard
+                    if server_active:
+                        state["session_false_count"] = 0
+                        # Refresh the start guard so it never expires during a long session
+                        if state["session_active"]:
+                            state["session_start_ms"] = time.ticks_ms()
 
             prev_active             = state["session_active"]
             state["session_active"] = server_active
 
-            # Server confirms session ended → clean up local state
+            # Server has definitively confirmed session ended → clean up
             if prev_active and not state["session_active"]:
-                state["session_paused"]  = False
-                state["active_card_id"]  = None
-                state["work_seconds"]    = 0
+                state["session_paused"]      = False
+                state["active_card_id"]      = None
+                state["work_seconds"]        = 0
+                state["session_false_count"] = 0
                 print("[SESSION] Server ended session — local reset")
 
             if boot_sync:
-                state["session_paused"]   = data.get("paused", False)
-                state["active_card_id"]   = (
+                state["session_paused"]      = data.get("paused", False)
+                state["active_card_id"]      = (
                     data.get("card_id") or data.get("rfid_card_id")
                 )
-                state["work_seconds"]     = int(data.get("work_seconds", 0))
+                state["work_seconds"]        = int(data.get("work_seconds", 0))
+                state["session_false_count"] = 0
                 print("[SESSION] Boot sync — active:", state["session_active"],
                       "paused:", state["session_paused"],
                       "card:", state["active_card_id"],
@@ -598,10 +582,7 @@ def boot():
     Startup sequence:
     1. Boot splash
     2. WiFi connection
-    3. Full session sync from server (boot_sync=True)
-       Restores: active, paused, work_seconds, active_card_id
-       This satisfies the requirement: if the device reboots during
-       a session, it reconnects and displays the session as if nothing happened.
+    3. Full session sync (boot_sync=True) — restores active session if any
     4. Draw correct initial screen
     """
     _draw_boot_msg("Booting...")
@@ -618,16 +599,9 @@ def boot():
 
 def loop():
     """
-    1-second tick loop with compensated sleep.
-
-    Each iteration measures its own execution time and sleeps only
-    the remaining time to reach 1000ms total. This gives a smooth
-    1-second timer regardless of how long HTTP calls take.
-
-    Examples:
-      Loop body = 50ms   → sleep 950ms → total ~1000ms  (normal)
-      Loop body = 800ms  → sleep 200ms → total ~1000ms  (during HTTP)
-      Loop body = 1200ms → sleep 0ms   → slightly late  (rare, slow network)
+    1-second tick with compensated sleep.
+    Measures loop body duration, sleeps only the remaining time to 1000ms.
+    Ensures smooth 1s timer regardless of HTTP call durations.
     """
     last_poll_ms = time.ticks_ms()
     last_wifi_ms = time.ticks_ms()
@@ -635,40 +609,33 @@ def loop():
     while True:
         tick_start_ms = time.ticks_ms()
 
-        # Step 1: buttons (both screens)
         handle_buttons()
 
-        # Step 2: RFID (main screen only)
         if state["screen"] == "main":
             card_id = read_rfid()
             if card_id:
                 handle_rfid(card_id)
 
-        # Step 3: periodic server sync (every SESSION_POLL_MS)
         now_ms = time.ticks_ms()
         if time.ticks_diff(now_ms, last_poll_ms) >= SESSION_POLL_MS:
             if state["wifi_connected"]:
                 fetch_session(boot_sync=False)
             last_poll_ms = time.ticks_ms()
 
-        # Step 4: periodic WiFi health check (every WIFI_CHECK_MS)
         now_ms = time.ticks_ms()
         if time.ticks_diff(now_ms, last_wifi_ms) >= WIFI_CHECK_MS:
             check_wifi_alive()
             last_wifi_ms = time.ticks_ms()
 
-        # Step 5: increment work timer
         if state["session_active"] and not state["session_paused"]:
             state["work_seconds"] = (state["work_seconds"] or 0) + 1
 
-        # Step 6: smart redraw (main screen only)
         if state["screen"] == "main":
             if _status_changed():
                 draw_session_screen() if state["session_active"] else draw_idle_screen()
             elif state["session_active"] and _time_changed():
                 draw_time_only()
 
-        # Step 7: compensated sleep
         gc.collect()
         elapsed_ms   = time.ticks_diff(time.ticks_ms(), tick_start_ms)
         remaining_ms = max(0, 1000 - elapsed_ms)
