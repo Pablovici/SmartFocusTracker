@@ -9,7 +9,7 @@ import network
 import urequests
 import ujson
 import unit
-from m5stack import lcd, btnA, btnB, btnC
+from m5stack import lcd, btnA, btnB, btnC, rgb  # rgb added for LED bar control
 
 # ============================================================
 # CONFIGURATION
@@ -56,6 +56,20 @@ COLOR_CARD_ACTIVE   = 0x0d2b1a
 COLOR_CARD_INACTIVE = 0x22223a
 SCREEN_W            = 320
 SCREEN_H            = 240
+
+# ============================================================
+# LED CONSTANTS
+# ============================================================
+# Colors match the on-screen status palette:
+#   Working  → green  (same family as COLOR_GOOD)
+#   Paused   → orange (same family as COLOR_WARN)
+#   No session → blue (same family as COLOR_ACCENT)
+#   Off      → used during boot before state is known
+LED_GREEN      = 0x00FF00   # Working
+LED_ORANGE     = 0xFF6600   # Paused
+LED_BLUE       = 0x0055FF   # No session / idle
+LED_OFF        = 0x000000   # Boot / transition — LEDs dark
+LED_BRIGHTNESS = 25         # % brightness (0–100). 25% = comfortable indoors.
 
 # ============================================================
 # HARDWARE INITIALIZATION
@@ -205,6 +219,26 @@ def _draw_time_zone(work_str):
     lcd.print(work_str, _cx(work_str, 15, -4), 140, COLOR_WHITE)
 
 # ============================================================
+# LED CONTROL
+# ============================================================
+
+def set_leds(color):
+    """
+    Sets all 10 SK6812 LEDs on the Core2 bottom bar to the given color.
+    Brightness is fixed at LED_BRIGHTNESS (25%) for indoor comfort.
+
+    Called once per state change (inside draw_*_screen functions),
+    never on every loop tick — avoids unnecessary LED flickering.
+
+    Wrapped in try/except: an LED failure must never crash the device.
+    """
+    try:
+        rgb.setBrightness(LED_BRIGHTNESS)  # Set global brightness before color
+        rgb.setColorAll(color)             # Apply color to all 10 LEDs at once
+    except Exception as e:
+        print("[LED] Failed:", e)          # Log silently — LEDs are non-critical
+
+# ============================================================
 # DISPLAY — bottom bars
 # ============================================================
 
@@ -292,6 +326,7 @@ def draw_idle_screen():
     lcd.font(lcd.FONT_DejaVu56)
     lcd.print("START", _cx("START", 34, -8), 128, COLOR_ACCENT)
     _draw_idle_bottom()
+    set_leds(LED_BLUE)      # No session → blue LED bar
     _update_last_drawn()
 
 def draw_session_screen():
@@ -300,9 +335,11 @@ def draw_session_screen():
     if state["session_paused"]:
         status_text, status_color = "PAUSED",  COLOR_WARN
         pause_label = "RESUME"
+        set_leds(LED_ORANGE)    # Paused → orange LED bar
     else:
         status_text, status_color = "WORKING", COLOR_GOOD
         pause_label = "PAUSE"
+        set_leds(LED_GREEN)     # Working → green LED bar
     lcd.font(lcd.FONT_DejaVu56)
     lcd.print(status_text, _cx(status_text, 34, -12), 62, status_color)
     _draw_time_zone(format_seconds(state["work_seconds"]))
@@ -325,6 +362,7 @@ def draw_error_screen(message, duration=3):
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print(hint, _cx(hint, 11, -4), 158, COLOR_GREY_SOFT)
     time.sleep(duration)
+    # After error, restore correct screen + correct LED color
     draw_session_screen() if state["session_active"] else draw_idle_screen()
 
 # ============================================================
@@ -411,7 +449,7 @@ def handle_rfid(card_id):
         state["session_start_ms"]  = time.ticks_ms()
         state["session_false_count"] = 0
         state["last_rfid_action_ms"] = time.ticks_ms()  # Trigger RFID cooldown
-        draw_session_screen()
+        draw_session_screen()   # Also sets LED green
         post_session_event("start", card_id)
         print("[RFID] Session started:", card_id)
 
@@ -433,7 +471,7 @@ def handle_rfid(card_id):
         state["session_end_ms"]      = time.ticks_ms()
         state["session_false_count"] = 0
         state["last_rfid_action_ms"] = time.ticks_ms()  # Trigger RFID cooldown
-        draw_idle_screen()
+        draw_idle_screen()      # Also sets LED blue
         post_session_event("end", card_id)
         print("[RFID] Session ended:", card_id)
 
@@ -476,12 +514,12 @@ def handle_buttons():
             return
         if state["session_paused"]:
             state["session_paused"] = False
-            draw_session_screen()
+            draw_session_screen()   # Also sets LED green
             post_session_event("resume", None)
             print("[BTN] Resumed")
         else:
             state["session_paused"] = True
-            draw_session_screen()
+            draw_session_screen()   # Also sets LED orange
             post_session_event("pause", None)
             print("[BTN] Paused")
 
@@ -606,16 +644,19 @@ def fetch_session(boot_sync=False):
 def boot():
     """
     Startup sequence:
-    1. Boot splash
-    2. WiFi connection
-    3. Full session sync (boot_sync=True) — restores active session if any
-    4. Draw correct initial screen
+    1. LEDs off during boot (state unknown)
+    2. Boot splash
+    3. WiFi connection
+    4. Full session sync (boot_sync=True) — restores active session if any
+    5. Draw correct initial screen (also sets correct LED color)
     """
+    set_leds(LED_OFF)            # LEDs dark while state is unknown
     _draw_boot_msg("Booting...")
     time.sleep(1)
     connect_wifi()
     if state["wifi_connected"]:
         fetch_session(boot_sync=True)
+    # draw_session_screen() / draw_idle_screen() each call set_leds internally
     draw_session_screen() if state["session_active"] else draw_idle_screen()
     print("[BOOT] Ready.")
 
