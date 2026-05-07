@@ -26,8 +26,8 @@ CLOUD_HOST       = "smartfocustracker-middleware-1054003632036.europe-west6.run.
 CLOUD_PORT       = 443
 NTP_UTC_OFFSET   = 2
 SENSOR_INTERVAL  = 10
-BQ_INTERVAL      = 30         # Offset from SENSOR_INTERVAL to avoid request collisions
-DRAW_INTERVAL    = 5
+BQ_INTERVAL      = 30
+DRAW_INTERVAL    = 2
 HUMIDITY_MIN     = 40
 WEATHER_INTERVAL = 1800
 ALERT_COOLDOWN   = 3600
@@ -36,9 +36,7 @@ PIR_ABSENT_ALERT = 300
 RECORD_SECS      = 5
 VOICE_FILE       = '/flash/voice.wav'
 RESP_FILE        = '/flash/res/resp.wav'
-# Device A is display-only for sessions — polls less than Device B (10s)
-# to avoid competing for the same Flask worker at the same time.
-SESSION_INTERVAL = 15
+SESSION_INTERVAL = 5
 
 KNOWN_NETWORKS = [
     ("iPhone de Amir", "toad1234"),
@@ -138,7 +136,7 @@ state = {
     "air_quality_label": "Unknown", "motion": False,
     "weather_temp": "--", "weather_cond": "N/A", "weather_city": "",
     "forecast": [],
-    "session_active": False, "session_paused": False, "session_work_sec": 0,
+    "session_active": False, "session_paused": False, "session_work_sec": 0, "session_false_count": 0,
     "time_str": "--:--", "date_str": "---",
 }
 
@@ -149,15 +147,13 @@ last_answer      = ""
 last_question    = ""
 
 # ============================================================
-# PARTIAL REDRAW — zone tracking for main screen (FIX 1)
+# PARTIAL REDRAW — zone tracking for main screen
 #
-# Instead of lcd.clear() on every DRAW_INTERVAL, we track what
-# was last drawn in each zone and only repaint the zones that changed.
-# No more full-screen flash every 5 seconds.
+# Main screen is split into 4 zones. Only changed zones are repainted.
+# Forecast and WiFi screens are drawn ONCE on entry only — no periodic
+# lcd.clear() that would cause a white flash every 5 seconds.
 # ============================================================
 
-# Sentinel values different from any real state value so all zones
-# are drawn on the very first call to smart_update_main_screen().
 _last_main = {
     "time_str":          None,
     "date_str":          None,
@@ -171,8 +167,6 @@ _last_main = {
     "session_paused":    None,
 }
 
-# Set to True whenever we need a full lcd.clear() redraw:
-# on first boot, and every time we switch back to screen 0.
 _main_needs_full_redraw = True
 
 # ============================================================
@@ -295,7 +289,6 @@ def draw_weather_icon(cx, cy, cond):
 # ============================================================
 
 def connect_wifi():
-    """Boot WiFi — tries all KNOWN_NETWORKS in order."""
     wlan.active(True)
     if wlan.isconnected(): return True
     for ssid, pwd in KNOWN_NETWORKS:
@@ -312,31 +305,23 @@ def connect_wifi():
 
 def connect_to_network(idx):
     """
-    FIX 2 — WiFi fallback.
-    Tries the requested network first. If it fails, automatically
-    falls back to the other network in KNOWN_NETWORKS.
-    The user is never left disconnected just because one network
-    was unavailable.
+    Tries the requested network first. If it fails, falls back
+    to the other network automatically.
     """
-    indices_to_try = [idx, 1 - idx]  # requested first, then fallback
-
-    for attempt, try_idx in enumerate(indices_to_try):
+    for attempt, try_idx in enumerate([idx, 1 - idx]):
         ssid, pwd = KNOWN_NETWORKS[try_idx]
         lcd.clear(COLOR_BG)
         lcd.font(lcd.FONT_DejaVu18)
         if attempt > 0:
-            # Show fallback indication
             lcd.print("Not found, trying:", 10, 60, COLOR_WARN)
         else:
             lcd.print("Connecting to:", 10, 80, COLOR_GREY)
         lcd.print(ssid, 10, 110, COLOR_WHITE)
-
         wlan.active(True)
         if wlan.isconnected():
             wlan.disconnect()
             time.sleep(1)
         wlan.connect(ssid, pwd)
-
         for i in range(15):
             lcd.fillRect(10, 148, 120, 20, COLOR_BG)
             lcd.print("." * (i % 4 + 1), 10, 150, COLOR_ACCENT)
@@ -347,12 +332,8 @@ def connect_to_network(idx):
                 time.sleep(1)
                 return True
             time.sleep(1)
-
-        # This network failed — will try the next one if available
         lcd.print("Failed.", 10, 180, COLOR_BAD)
         time.sleep(1)
-
-    # Both networks failed
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print("No WiFi available", 10, 110, COLOR_BAD)
@@ -378,11 +359,6 @@ def read_sensors():
     state["air_quality_label"] = classify_air(state["co2_ppm"])
 
 def post_indoor():
-    """
-    Posts indoor sensor data to middleware.
-    gc.collect() called BEFORE the request to free memory first —
-    prevents MemoryError on long-running sessions.
-    """
     payload = {
         "temperature": state["temperature"], "humidity": state["humidity"],
         "co2_ppm": state["co2_ppm"], "tvoc_ppb": state["tvoc_ppb"],
@@ -403,10 +379,6 @@ def post_indoor():
 # ============================================================
 
 def fetch_weather():
-    """
-    gc.collect() before the call prevents MicroPython heap
-    fragmentation from causing MemoryError on long runtimes.
-    """
     gc.collect()
     try:
         r = urequests.get(MIDDLEWARE_URL + "/weather")
@@ -422,22 +394,29 @@ def fetch_weather():
     gc.collect()
 
 def fetch_session():
-    """
-    FIX 3 — Reads session state from middleware.
-    gc.collect() BEFORE the call is the key fix for session data
-    becoming permanently stale after the device has been running
-    for a long time. MicroPython's heap fragments over time and
-    urequests.get() fails to allocate if GC hasn't run recently.
-    Without the pre-call GC, exceptions are swallowed and the
-    session display freezes at the last known state indefinitely.
-    """
     gc.collect()
     try:
         r = urequests.get(MIDDLEWARE_URL + "/session/current")
         if r.status_code == 200:
-            d = ujson.loads(r.text)
-            state["session_active"]   = d.get("active", False)
-            state["session_paused"]   = d.get("paused", False)
+            d            = ujson.loads(r.text)
+            server_active = d.get("active", False)
+            server_paused = d.get("paused", False)
+
+            # Guard — même logique que Device B :
+            # Si on pense que la session est active mais le serveur dit False,
+            # on exige 3 confirmations consécutives avant d'accepter.
+            # Un seul False (serveur occupé, réseau instable) est ignoré.
+            if state["session_active"] and not server_active:
+                state["session_false_count"] += 1
+                if state["session_false_count"] < 3:
+                    r.close()
+                    gc.collect()
+                    return   # On ignore ce faux négatif
+            else:
+                state["session_false_count"] = 0   # Reset dès que serveur confirme True
+
+            state["session_active"]   = server_active
+            state["session_paused"]   = server_paused
             state["session_work_sec"] = d.get("work_seconds", 0)
         r.close()
     except Exception as e:
@@ -445,7 +424,6 @@ def fetch_session():
     gc.collect()
 
 def sync_latest():
-    """Restores last sensor values from BigQuery on boot."""
     gc.collect()
     try:
         r = urequests.get(MIDDLEWARE_URL + "/latest")
@@ -662,33 +640,27 @@ def check_alerts():
                 alert_times["absent"] = now
 
 # ============================================================
-# DISPLAY — MAIN SCREEN ZONES (FIX 1)
-#
-# The main screen is split into 4 independent zones.
-# Each zone function erases only its own rectangle, then repaints.
-# No lcd.clear() needed — no full-screen flash.
+# DISPLAY — MAIN SCREEN ZONES
 #
 # Zone layout:
-#   y=  0–32 : time zone    (time, date)
-#   y= 32–100: weather zone (outdoor temp, condition)
-#   y=100     : divider line (drawn once, never erased)
-#   y=101–162: sensor zone  (indoor values, air quality)
-#   y=162–210: session zone (session state label)
+#   y=  0–32 : time zone
+#   y= 32–100: weather zone
+#   y=100     : divider (drawn once, never erased by zones)
+#   y=101–162: sensor zone
+#   y=162–210: session zone
 #   y=210–240: button hints (drawn once, static)
 # ============================================================
 
 def _zone_time():
-    """Redraws the time and date line without touching other zones."""
     lcd.fillRect(0, 0, 320, 32, COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
-    lcd.print(state["time_str"], 10,  8, COLOR_WHITE)
+    lcd.print(state["time_str"], 10, 8, COLOR_WHITE)
     lcd.print(state["date_str"], 175, 8, COLOR_GREY)
     _last_main["time_str"] = state["time_str"]
     _last_main["date_str"] = state["date_str"]
 
 def _zone_weather():
-    """Redraws outdoor weather without touching the divider at y=100."""
-    lcd.fillRect(0, 32, 320, 68, COLOR_BG)   # y=32 to y=99
+    lcd.fillRect(0, 32, 320, 68, COLOR_BG)
     wcol = condition_color(state["weather_cond"])
     lcd.font(lcd.FONT_DejaVu24)
     lcd.print("{}C".format(state["weather_temp"]), 10, 40, wcol)
@@ -699,8 +671,7 @@ def _zone_weather():
     _last_main["weather_city"] = state["weather_city"]
 
 def _zone_sensors():
-    """Redraws indoor sensor values. Starts at y=101 to preserve the divider."""
-    lcd.fillRect(0, 101, 320, 61, COLOR_BG)  # y=101 to y=161
+    lcd.fillRect(0, 101, 320, 61, COLOR_BG)
     t = state["temperature"]; h = state["humidity"]
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print("In: {}C  {}%".format(
@@ -713,8 +684,7 @@ def _zone_sensors():
     _last_main["air_quality_label"] = state["air_quality_label"]
 
 def _zone_session():
-    """Redraws the session status label only."""
-    lcd.fillRect(0, 162, 320, 48, COLOR_BG)  # y=162 to y=209
+    lcd.fillRect(0, 162, 320, 48, COLOR_BG)
     if state["session_active"]:
         label = "Paused"   if state["session_paused"] else "Working"
         color = COLOR_WARN if state["session_paused"] else COLOR_GOOD
@@ -727,7 +697,6 @@ def _zone_session():
     _last_main["session_paused"] = state["session_paused"]
 
 def _zone_buttons():
-    """Button hints — static, drawn once during full redraw."""
     wcol = condition_color(state["weather_cond"])
     lcd.font(lcd.FONT_Default)
     lcd.print("[WiFi]",     10,  220, COLOR_ACCENT)
@@ -735,13 +704,9 @@ def _zone_buttons():
     lcd.print("[Forecast]", 225, 220, wcol)
 
 def draw_main_screen():
-    """
-    Full initial draw — lcd.clear() + all zones + divider + buttons.
-    Called only: on boot, and when returning from another screen.
-    After this, smart_update_main_screen() handles all updates.
-    """
+    """Full redraw — only called on boot and when returning from another screen."""
     lcd.clear(COLOR_BG)
-    lcd.line(0, 100, 320, 100, COLOR_DIVIDER)  # divider — never erased by zones
+    lcd.line(0, 100, 320, 100, COLOR_DIVIDER)
     _zone_time()
     _zone_weather()
     _zone_sensors()
@@ -750,10 +715,8 @@ def draw_main_screen():
 
 def smart_update_main_screen():
     """
-    FIX 1 — Partial update instead of full redraw.
-    Compares each zone's current state against _last_main.
-    Only repaints zones where data changed.
-    No lcd.clear() → no full-screen flash.
+    Partial update — only repaints zones where data changed.
+    No lcd.clear() → no screen flash.
     """
     if (state["time_str"] != _last_main["time_str"] or
             state["date_str"] != _last_main["date_str"]):
@@ -763,7 +726,7 @@ def smart_update_main_screen():
             state["weather_cond"] != _last_main["weather_cond"] or
             state["weather_city"] != _last_main["weather_city"]):
         _zone_weather()
-        _zone_buttons()   # Button hint color depends on weather condition
+        _zone_buttons()
 
     if (state["temperature"]       != _last_main["temperature"] or
             state["humidity"]          != _last_main["humidity"] or
@@ -801,6 +764,10 @@ def draw_answer_screen():
     lcd.print("[Back]", 240, 220, COLOR_GREY)
 
 def draw_forecast_screen():
+    """
+    Drawn ONCE when the user presses [Forecast].
+    Never called from the main loop — no periodic lcd.clear() flash.
+    """
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
     lcd.print("5-Day Forecast", 55, 6, COLOR_WHITE)
@@ -862,6 +829,10 @@ def _wifi_draw_card(x, y, w, h, ssid):
         lcd.print("connect", x+7, y+88, COLOR_GREY_DIM)
 
 def draw_wifi_screen():
+    """
+    Drawn ONCE when the user presses [WiFi].
+    Never called from the main loop.
+    """
     lcd.clear(COLOR_BG)
     lcd.font(lcd.FONT_DejaVu18)
     title = "WiFi Selection"
@@ -881,9 +852,11 @@ def draw_wifi_screen():
 
 def handle_buttons():
     """
-    FIX 1 — sets _main_needs_full_redraw = True whenever returning
-    to screen 0 from another screen, so the next draw cycle does a
-    full lcd.clear() + redraw instead of a partial update on a stale bg.
+    Forecast (screen 3) and WiFi (screen 4) are drawn immediately
+    on entry via handle_buttons. They are NEVER redrawn in the loop.
+    This eliminates the periodic lcd.clear() that caused the white flash.
+
+    Main screen returns to smart partial updates.
     """
     global current_screen, _main_needs_full_redraw
 
@@ -913,13 +886,15 @@ def handle_buttons():
     else:
         if btnA.wasPressed():
             current_screen = 4
-            draw_wifi_screen()
+            draw_wifi_screen()       # Draw once on entry — not repeated in loop
+
         if btnB.wasPressed():
             voice_flow()
-            _main_needs_full_redraw = True   # voice_flow() may have overwritten screen
+            _main_needs_full_redraw = True
+
         if btnC.wasPressed():
             current_screen = 3
-            draw_forecast_screen()
+            draw_forecast_screen()   # Draw once on entry — not repeated in loop
 
 # ============================================================
 # BOOT
@@ -953,13 +928,11 @@ def boot():
 
 def loop():
     """
-    Main event loop.
-    FIX 1: smart_update_main_screen() replaces draw_main_screen() for
-    periodic redraws — only changed zones are repainted.
-    FIX 2: connect_to_network() handles WiFi fallback internally.
-    FIX 3: gc.collect() before each network call prevents memory
-    fragmentation from silently breaking fetch_session() after
-    long runtimes.
+    Key design decisions:
+    - Main screen (0): smart partial zone updates every DRAW_INTERVAL
+    - Forecast (3) and WiFi (4): drawn once on entry via handle_buttons,
+      NEVER redrawn in the loop. This eliminates lcd.clear() flashes.
+    - gc.collect() before all network calls prevents heap fragmentation.
     """
     global last_motion_time, _main_needs_full_redraw
     last_sensor  = 0; last_bq      = 0; last_weather = 0
@@ -997,19 +970,15 @@ def loop():
         check_alerts()
         handle_buttons()
 
+        # Only the main screen is redrawn periodically.
+        # Forecast and WiFi screens are static once drawn — no loop redraw.
         if now - last_draw >= DRAW_INTERVAL:
             if current_screen == 0:
                 if _main_needs_full_redraw:
-                    # Full redraw when returning from another screen
                     draw_main_screen()
                     _main_needs_full_redraw = False
                 else:
-                    # Partial update — only changed zones repainted
                     smart_update_main_screen()
-            elif current_screen == 3:
-                draw_forecast_screen()
-            elif current_screen == 4:
-                draw_wifi_screen()
             last_draw = now
 
         gc.collect()

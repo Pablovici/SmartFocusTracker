@@ -40,14 +40,21 @@ app = Flask(__name__)
 
 _session = {
     "session_id":   None,
-    "card_id":      None,    # Card that started the session — returned in /session/current
+    "card_id":      None,
     "active":       False,
     "paused":       False,
     "work_seconds": 0,
-    "work_start":   None,    # Unix timestamp at session start
-    "pause_start":  None,    # Unix timestamp when current pause began
-    "pauses":       [],      # List of {pause_start, pause_end, duration_sec}
+    "work_start":   None,
+    "pause_start":  None,
+    "pauses":       [],
 }
+
+# Weather cache — avoids hammering OpenWeatherMap on every request.
+# Both devices + Streamlit can call /weather independently;
+# without caching this could trigger rate-limiting.
+# Cache TTL matches the devices' WEATHER_INTERVAL (30 min).
+_weather_cache = {"data": None, "ts": 0}
+WEATHER_CACHE_TTL = 1800  # seconds (30 min)
 
 # ============================================================
 # HELPERS
@@ -117,15 +124,27 @@ def get_latest():
 
 @app.route("/weather", methods=["GET"])
 def weather():
-    # Fetches current weather from OpenWeatherMap via weather_service.
-    # Stores the current snapshot in BigQuery, returns full response
-    # (current conditions + multi-day forecast) to the calling device.
+    """
+    Returns current weather + forecast.
+    Responses are cached for WEATHER_CACHE_TTL (30 min) to avoid
+    hammering OpenWeatherMap on every poll from devices and Streamlit.
+    If the external fetch fails but a cached response exists, the stale
+    cache is returned with a 200 so devices always get usable data.
+    """
+    now = time.time()
+    if _weather_cache["data"] and now - _weather_cache["ts"] < WEATHER_CACHE_TTL:
+        return jsonify(_weather_cache["data"]), 200
     try:
         data = get_weather()
         bq.insert_outdoor(data["current"])
+        _weather_cache["data"] = data
+        _weather_cache["ts"]   = now
         return jsonify(data), 200
     except Exception as e:
         print("[WEATHER] Error:", e)
+        if _weather_cache["data"]:
+            print("[WEATHER] Returning stale cache")
+            return jsonify(_weather_cache["data"]), 200
         return jsonify({"error": str(e)}), 500
 
 # ============================================================
@@ -374,7 +393,8 @@ def history_sessions():
 
 @app.route("/history/session-stats", methods=["GET"])
 def session_stats():
-    return jsonify(bq.get_session_stats()), 200
+    days = request.args.get("days", 30, type=int)
+    return jsonify(bq.get_session_stats(days=days)), 200
 
 @app.route("/history/alerts", methods=["GET"])
 def history_alerts():

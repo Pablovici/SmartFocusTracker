@@ -53,10 +53,13 @@ def parse_dt(value):
     return None
 
 def run_query(sql):
-    # Executes a SQL query and returns results as a list of dicts.
-    # query_job.result() blocks until the query completes.
+    """
+    Executes a SQL query and returns results as a list of dicts.
+    timeout=30 prevents the Flask worker from blocking indefinitely
+    if BigQuery is slow or unreachable.
+    """
     query_job = client.query(sql)
-    return [dict(row) for row in query_job.result()]
+    return [dict(row) for row in query_job.result(timeout=30)]
 
 # ============================================================
 # INDOOR READINGS
@@ -197,8 +200,11 @@ def get_session_history(limit=20):
     """.format(TABLE_SESSIONS, limit)
     return run_query(sql)
 
-def get_session_stats():
-    # Returns aggregate session statistics for the Streamlit dashboard.
+def get_session_stats(days=30):
+    """
+    Aggregate session statistics for the last N days.
+    Default 30 days — avoids pulling all-time stats which grow unbounded.
+    """
     sql = """
         SELECT
             COUNT(*)                AS total_sessions,
@@ -207,7 +213,8 @@ def get_session_stats():
             MAX(total_work_minutes) AS longest_session_minutes
         FROM `{}`
         WHERE end_time IS NOT NULL
-    """.format(TABLE_SESSIONS)
+          AND start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {} DAY)
+    """.format(TABLE_SESSIONS, days)
     rows = run_query(sql)
     return rows[0] if rows else {}
 

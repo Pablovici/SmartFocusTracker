@@ -32,6 +32,13 @@ BTN_DEBOUNCE_MS = 500     # Minimum ms between button events
 SESSION_FALSE_THRESHOLD        = 6
 SESSION_FALSE_THRESHOLD_PAUSED = 12
 
+# Cooldown after a session start/end to prevent ghost RFID reads.
+# When the user taps to end a session and the card stays near the reader,
+# tiny fluctuations in isCardOn() can cause read_rfid() to falsely
+# detect a "new" tap, instantly starting a new session.
+# 3 seconds is enough time for the user to remove the card after a tap.
+RFID_COOLDOWN_MS = 3000
+
 # ============================================================
 # DISPLAY CONSTANTS
 # ============================================================
@@ -79,11 +86,12 @@ state = {
     "last_btn_ms":        0,
     "session_start_ms":   0,
     "session_end_ms":     0,
-    # KEY FIX — counts consecutive active=False responses from the server.
-    # Device B only resets when this reaches SESSION_FALSE_THRESHOLD (3).
-    # A single bad/partial server response is ignored — session stays alive.
-    # Counter resets to 0 immediately when server confirms active=True.
     "session_false_count": 0,
+    # GHOST RFID FIX — timestamp of the last session start or end action.
+    # While within RFID_COOLDOWN_MS of this timestamp, read_rfid() returns
+    # None, ignoring any card reads. Prevents the user's badge from
+    # accidentally starting a new session immediately after tapping to end one.
+    "last_rfid_action_ms": 0,
 }
 
 _last_drawn = {
@@ -358,7 +366,20 @@ def read_rfid():
     """
     Returns a UID only on a fresh tap.
     Resets last_raw_card to None when card is removed.
+
+    GHOST RFID FIX — cooldown:
+    For RFID_COOLDOWN_MS after any handle_rfid() call (start or end),
+    this function returns None unconditionally. This prevents the
+    badge from being re-detected as a "new tap" while still near the
+    reader, which was causing a session to immediately restart after
+    being ended.
     """
+    # Cooldown check — skip ALL RFID logic during cooldown
+    if state["last_rfid_action_ms"] != 0:
+        elapsed = time.ticks_diff(time.ticks_ms(), state["last_rfid_action_ms"])
+        if 0 <= elapsed < RFID_COOLDOWN_MS:
+            return None
+
     try:
         if rfid.isCardOn():
             card_id = str(rfid.readUid())
@@ -388,7 +409,8 @@ def handle_rfid(card_id):
         state["work_seconds"]      = 0
         state["active_card_id"]    = card_id
         state["session_start_ms"]  = time.ticks_ms()
-        state["session_false_count"] = 0   # Reset false counter on new session
+        state["session_false_count"] = 0
+        state["last_rfid_action_ms"] = time.ticks_ms()  # Trigger RFID cooldown
         draw_session_screen()
         post_session_event("start", card_id)
         print("[RFID] Session started:", card_id)
@@ -410,6 +432,7 @@ def handle_rfid(card_id):
         state["work_seconds"]        = 0
         state["session_end_ms"]      = time.ticks_ms()
         state["session_false_count"] = 0
+        state["last_rfid_action_ms"] = time.ticks_ms()  # Trigger RFID cooldown
         draw_idle_screen()
         post_session_event("end", card_id)
         print("[RFID] Session ended:", card_id)
