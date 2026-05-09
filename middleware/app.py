@@ -335,6 +335,21 @@ def speak():
 # STT + LLM
 # ============================================================
 
+@app.route("/voice/transcribe", methods=["POST"])
+def voice_transcribe():
+    # STT only — receives base64 WAV, returns {"transcript": "..."}.
+    data      = request.get_json()
+    audio_b64 = data.get("audio_b64") if data else None
+    if not audio_b64:
+        return jsonify({"error": "No audio provided"}), 400
+    try:
+        transcript = speech_to_text(audio_b64)
+        print("[STT] Transcript:", transcript)
+        return jsonify({"transcript": transcript}), 200
+    except Exception as e:
+        print("[STT] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/llm", methods=["POST"])
 def llm():
     # Text-only LLM endpoint with optional sensor context.

@@ -21,8 +21,8 @@ stt_client = speech.SpeechClient()
 # CONFIGURATION
 # ============================================================
 
-LANGUAGE    = os.environ.get("SPEECH_LANGUAGE", "en-US")
-VOICE_NAME  = os.environ.get("TTS_VOICE", "en-US-Standard-C")
+LANGUAGE    = os.environ.get("SPEECH_LANGUAGE", "fr-FR")
+VOICE_NAME  = os.environ.get("TTS_VOICE", "fr-FR-Standard-C")
 
 # ============================================================
 # TEXT TO SPEECH
@@ -82,9 +82,13 @@ def text_to_speech_wav(text):
 
 def speech_to_text(audio_b64):
     # Converts base64-encoded audio to a text string.
-    # Audio must be recorded at 16000 Hz mono — standard for M5Stack mic.
-    # Returns transcribed text, or empty string if recognition fails.
+    # M5Stack MicRecord saves a full WAV file — strip the 44-byte PCM header
+    # before sending to the STT API which expects raw LINEAR16 audio.
     audio_bytes = base64.b64decode(audio_b64)
+
+    # Strip WAV container header if present (standard PCM WAV = 44 bytes)
+    if audio_bytes[:4] == b'RIFF':
+        audio_bytes = audio_bytes[44:]
 
     audio = speech.RecognitionAudio(content=audio_bytes)
 

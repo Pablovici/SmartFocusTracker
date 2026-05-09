@@ -39,7 +39,7 @@ RESP_FILE        = '/flash/res/resp.wav'
 SESSION_INTERVAL = 5
 
 KNOWN_NETWORKS = [
-    ("iPhone de Amir", "toad1234"),
+    ("iPhone de Pablo", "1234567890"),
     ("iot-unil",       "4u6uch4hpY9pJ2f9"),
 ]
 
@@ -113,13 +113,37 @@ class SGP30:
 # ============================================================
 # HARDWARE INITIALIZATION
 # ============================================================
-i2c_a = I2C(1, scl=Pin(33), sda=Pin(32), freq=100000)
-i2c_c = I2C(scl=Pin(13), sda=Pin(14), freq=100000)
-env   = SHT30(i2c_a)
-tvoc  = SGP30(i2c_c)
-pir   = Pin(26, Pin.IN)
-wlan  = network.WLAN(network.STA_IF)
-mic   = MicRecord()
+try:
+    i2c_a = I2C(1, scl=Pin(33), sda=Pin(32), freq=100000)
+except Exception as e:
+    print("[HW] i2c_a:", e); i2c_a = None
+
+try:
+    i2c_c = I2C(scl=Pin(13), sda=Pin(14), freq=100000)
+except Exception as e:
+    print("[HW] i2c_c:", e); i2c_c = None
+
+try:
+    env = SHT30(i2c_a) if i2c_a else None
+except Exception as e:
+    print("[HW] SHT30:", e); env = None
+
+try:
+    tvoc = SGP30(i2c_c) if i2c_c else None
+except Exception as e:
+    print("[HW] SGP30:", e); tvoc = None
+
+try:
+    pir = Pin(26, Pin.IN)
+except Exception as e:
+    print("[HW] PIR:", e); pir = None
+
+wlan = network.WLAN(network.STA_IF)
+
+try:
+    mic = MicRecord()
+except Exception as e:
+    print("[HW] MicRecord:", e); mic = None
 
 try:
     os.mkdir('/flash/res')
@@ -445,10 +469,10 @@ def sync_latest():
     gc.collect()
 
 # ============================================================
-# HTTPS SOCKET — stream WAV to /ask
+# HTTPS SOCKET — stream WAV to /voice/transcribe (STT)
 # ============================================================
 
-def _ssl_post_wav_to_ask(filepath):
+def _ssl_post_wav_transcribe(filepath):
     sz = file_size(filepath)
     if sz <= 0: return None, 'empty file'
     prefix   = b'{"audio_b64":"'
@@ -456,7 +480,7 @@ def _ssl_post_wav_to_ask(filepath):
     b64_len  = ((sz + 2) // 3) * 4
     body_len = len(prefix) + b64_len + len(suffix)
     req = (
-        'POST /ask HTTP/1.1\r\n'
+        'POST /voice/transcribe HTTP/1.1\r\n'
         'Host: ' + CLOUD_HOST + '\r\n'
         'Content-Type: application/json\r\n'
         'Content-Length: ' + str(body_len) + '\r\n'
@@ -551,45 +575,180 @@ def _ssl_post_to_wav_file(path, payload_dict, out_file):
             except: pass
 
 # ============================================================
+# VOICE — HELPERS
+# ============================================================
+
+def _build_sensor_context():
+    s = state
+    parts = []
+    if s["temperature"] is not None:
+        parts.append("Temp: {}C".format(s["temperature"]))
+    if s["humidity"] is not None:
+        parts.append("Humidity: {}%".format(s["humidity"]))
+    if s["co2_ppm"] is not None:
+        parts.append("CO2: {}ppm".format(s["co2_ppm"]))
+    if s["air_quality_label"]:
+        parts.append("Air: {}".format(s["air_quality_label"]))
+    parts.append("Outdoor: {}, {}C".format(s["weather_cond"], s["weather_temp"]))
+    if s["session_active"]:
+        parts.append("Session: {}min worked".format(int(s["session_work_sec"] // 60)))
+    return ", ".join(parts)
+
+def _llm_ask(question):
+    try:
+        r = urequests.post(MIDDLEWARE_URL + "/llm",
+            headers={"Content-Type": "application/json"},
+            data=ujson.dumps({"question": question,
+                              "context":  _build_sensor_context()}))
+        if r.status_code == 200:
+            answer = ujson.loads(r.text).get("answer", "")
+            r.close()
+            return answer
+        r.close()
+        return ""
+    except Exception as e:
+        print("[LLM]", e)
+        return ""
+
+def bip(freq=1200):
+    try: speaker.sing(freq, 1, 200)
+    except:
+        try: speaker.playTone(freq, 1)
+        except: pass
+
+def draw_voice_screen(status, step="", question="", answer="", status_col=None):
+    if status_col is None: status_col = COLOR_WHITE
+    lcd.clear(COLOR_BG)
+    # Header
+    lcd.font(lcd.FONT_DejaVu18)
+    lcd.print("Voice Assistant", 50, 6, COLOR_ACCENT)
+    lcd.line(0, 30, 320, 30, COLOR_DIVIDER)
+    # Status
+    lcd.font(lcd.FONT_DejaVu18)
+    lcd.print(status[:26], 10, 36, status_col)
+    # Step
+    if step:
+        lcd.font(lcd.FONT_Default)
+        lcd.print(step[:44], 10, 62, COLOR_GREY)
+    # Question
+    y = 82
+    if question:
+        lcd.line(0, y, 320, y, COLOR_DIVIDER); y += 6
+        lcd.font(lcd.FONT_Default)
+        lcd.print("Q: " + question[:40], 10, y, COLOR_GREY); y += 13
+        if len(question) > 40:
+            lcd.print("   " + question[40:80], 10, y, COLOR_GREY); y += 13
+    # Answer
+    if answer:
+        lcd.line(0, y + 2, 320, y + 2, COLOR_DIVIDER); y += 8
+        words = answer.split(" "); lines = []; line = ""
+        for word in words:
+            if len(line) + len(word) + 1 <= 46:
+                line = line + " " + word if line else word
+            else:
+                lines.append(line); line = word
+        if line: lines.append(line)
+        for l in lines[:5]:
+            lcd.print(l, 10, y, COLOR_GOOD); y += 14
+    # Boutons tactiles en bas (identiques a test_voice)
+    lcd.font(lcd.FONT_Default)
+    lcd.fillRect(0,   210, 106, 30, 0x333333)
+    lcd.fillRect(107, 210, 106, 30, 0x004466)
+    lcd.fillRect(213, 210, 107, 30, 0x333333)
+    lcd.print("Quitter", 14,  218, COLOR_GREY)
+    lcd.print("PARLER",  128, 218, COLOR_ACCENT)
+    lcd.print("Quitter", 220, 218, COLOR_GREY)
+
+# ============================================================
 # VOICE FLOW
 # ============================================================
 
 def voice_flow():
     global last_answer, last_question, current_screen
-    show_msg("Preparez-vous...")
+    current_screen = 2
+
+    if mic is None:
+        draw_voice_screen("Micro KO", "MicRecord non initialise",
+                          status_col=COLOR_BAD)
+        time.sleep(3); return
+
+    # Preparation + bip depart
+    draw_voice_screen("Preparez-vous...", "Parlez apres le bip")
     time.sleep(1)
-    try: speaker.sing(1200, 1, 200)
-    except: pass
+    bip(1200)
     time.sleep_ms(150)
-    show_msg(">>> PARLEZ <<<")
-    mic.record2file(RECORD_SECS, VOICE_FILE)
-    try: speaker.sing(800, 1, 150)
-    except: pass
-    sz = file_size(VOICE_FILE)
-    if sz < 1000:
-        show_msg("Rien entendu\nReessayez"); time.sleep(2); return
-    show_msg("Analyse...")
-    code, body = _ssl_post_wav_to_ask(VOICE_FILE)
-    gc.collect()
-    if code is None or code != 200:
-        show_msg("Erreur reseau"); time.sleep(2); return
+
+    # 1/3 Enregistrement
+    draw_voice_screen(">>> PARLEZ <<<",
+                      "Enregistrement {}s...".format(RECORD_SECS),
+                      status_col=COLOR_BAD)
     try:
-        resp = ujson.loads(body)
-        answer = resp.get('answer_text', '')
-        last_question = resp.get('question', '')
+        mic.record2file(RECORD_SECS, VOICE_FILE)   # duree en premier
+    except Exception as e:
+        print("[MIC]", e)
+    bip(800)
+
+    sz = file_size(VOICE_FILE)
+    print("[MIC] file size:", sz)
+    if sz < 1000:
+        draw_voice_screen("Rien entendu",
+                          "Taille: {}B — parlez plus fort".format(sz),
+                          status_col=COLOR_WARN)
+        time.sleep(3); return
+
+    # 2/3 Transcription STT
+    draw_voice_screen("Transcription...", "Envoi audio...",
+                      status_col=COLOR_ACCENT)
+    code, body = _ssl_post_wav_transcribe(VOICE_FILE)
+    gc.collect()
+
+    if code is None or code != 200:
+        draw_voice_screen("Erreur STT",
+                          "Code: {}".format(code),
+                          status_col=COLOR_BAD)
+        time.sleep(3); return
+
+    try:
+        transcript = ujson.loads(body).get("transcript", "").strip()
     except:
-        show_msg("Erreur JSON"); time.sleep(2); return
+        draw_voice_screen("Erreur JSON", "Reponse STT invalide",
+                          status_col=COLOR_BAD)
+        time.sleep(2); return
+
+    if not transcript:
+        draw_voice_screen("Rien transcrit", "Parlez plus pres du micro",
+                          status_col=COLOR_WARN)
+        time.sleep(3); return
+
+    last_question = transcript
+
+    # 3/3 LLM
+    draw_voice_screen("Reflexion...", transcript[:44],
+                      status_col=COLOR_ACCENT)
+    answer = _llm_ask(transcript)
+    gc.collect()
+
     if not answer:
-        show_msg("Pas de reponse\nIA indisponible"); time.sleep(2); return
+        draw_voice_screen("IA indisponible", "",
+                          question=transcript, status_col=COLOR_WARN)
+        time.sleep(3); return
+
     last_answer = answer
-    show_msg("Synthese vocale...")
+
+    # TTS — synthese + lecture
+    draw_voice_screen("Synthese...", answer[:44], status_col=COLOR_ACCENT)
     ok, msg = _ssl_post_to_wav_file('/speak-wav', {'text': answer}, RESP_FILE)
     gc.collect()
-    current_screen = 2
-    draw_answer_screen()
+
+    draw_voice_screen("Reponse !",
+                      "Appuie PARLER pour rejouer",
+                      question=transcript, answer=answer,
+                      status_col=COLOR_GOOD)
     if ok:
-        try: speaker.playWAV('res/resp.wav', volume=10)
+        try: speaker.playWAV('res/resp.wav', volume=8)
         except Exception as e: print("[SPEAKER]", e)
+    else:
+        draw_voice_screen("TTS KO", msg[:44], status_col=COLOR_BAD)
     gc.collect()
 
 # ============================================================
@@ -879,9 +1038,10 @@ def handle_buttons():
             _main_needs_full_redraw = True
 
     elif current_screen == 2:
-        if btnA.wasPressed():
+        if btnA.wasPressed() or btnB.wasPressed() or btnC.wasPressed():
             current_screen = 0
-            _main_needs_full_redraw = True
+            draw_main_screen()
+            _main_needs_full_redraw = False
 
     else:
         if btnA.wasPressed():
@@ -901,6 +1061,8 @@ def handle_buttons():
 # ============================================================
 
 def boot():
+    try: speaker.setVolume(8)
+    except: pass
     show_msg("Booting...")
     time.sleep(1)
     show_msg("Warming up\nair sensor...")
