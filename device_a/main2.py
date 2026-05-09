@@ -28,16 +28,19 @@ SENSOR_INTERVAL  = 10
 BQ_INTERVAL      = 30
 DRAW_INTERVAL    = 2
 HUMIDITY_MIN     = 40
+HUMIDITY_MAX     = 60
 WEATHER_INTERVAL = 1800
 ALERT_COOLDOWN   = 3600
 BREAK_INTERVAL   = 2700   # 45 minutes
 RECORD_SECS      = 3
 VOICE_FILE       = '/flash/voice.wav'
 RESP_FILE        = '/flash/res/resp.wav'
-ALERT_WAV_BREAK  = '/flash/res/alert_break.wav'
-ALERT_WAV_AIR    = '/flash/res/alert_air.wav'
-ALERT_TEXT_BREAK = "Vous travaillez depuis 45 minutes. Il est temps de faire une pause !"
-ALERT_TEXT_AIR   = "La qualite de l air est mauvaise. Pensez a aerer la piece."
+ALERT_WAV_BREAK        = '/flash/res/alert_break.wav'
+ALERT_WAV_AIR          = '/flash/res/alert_air.wav'
+ALERT_WAV_HUMID_HIGH   = '/flash/res/alert_humid_high.wav'
+ALERT_TEXT_BREAK       = "Vous travaillez depuis 45 minutes. Il est temps de faire une pause !"
+ALERT_TEXT_AIR         = "La qualite de l air est mauvaise. Pensez a aerer la piece."
+ALERT_TEXT_HUMID_HIGH  = "L air est trop humide. Pensez a ventiler la piece pour eviter les moisissures."
 SESSION_INTERVAL = 5
 
 KNOWN_NETWORKS = [
@@ -166,7 +169,7 @@ state = {
     "time_str": "--:--", "date_str": "---",
 }
 
-alert_times      = {"humidity": -ALERT_COOLDOWN, "air": -ALERT_COOLDOWN, "break": -ALERT_COOLDOWN}
+alert_times      = {"humidity": -ALERT_COOLDOWN, "humidity_high": -ALERT_COOLDOWN, "air": -ALERT_COOLDOWN, "break": -ALERT_COOLDOWN}
 last_motion_time = 0
 current_screen   = 0
 last_answer      = ""
@@ -867,8 +870,9 @@ def speak_alert(text):
 def _ensure_alert_wavs():
     """Telecharge les WAV d'alerte fixes au boot si absents."""
     for wav_path, text in [
-        (ALERT_WAV_BREAK, ALERT_TEXT_BREAK),
-        (ALERT_WAV_AIR,   ALERT_TEXT_AIR),
+        (ALERT_WAV_BREAK,      ALERT_TEXT_BREAK),
+        (ALERT_WAV_AIR,        ALERT_TEXT_AIR),
+        (ALERT_WAV_HUMID_HIGH, ALERT_TEXT_HUMID_HIGH),
     ]:
         try:
             os.stat(wav_path)
@@ -901,7 +905,7 @@ def check_alerts():
             speak_alert_cached(ALERT_WAV_AIR, ALERT_TEXT_AIR)
             alert_times["air"] = now
 
-    # Alerte humidite — dynamique (inclut le % reel)
+    # Alerte humidite basse — dynamique (inclut le % reel)
     h = state["humidity"]
     if h is not None and h < HUMIDITY_MIN:
         if now - alert_times["humidity"] > ALERT_COOLDOWN:
@@ -909,6 +913,12 @@ def check_alerts():
                 "L air est trop sec, {}% d humidite. "
                 "Pensez a humidifier la piece.".format(int(h)))
             alert_times["humidity"] = now
+
+    # Alerte humidite haute — WAV pre-genere
+    if h is not None and h > HUMIDITY_MAX:
+        if now - alert_times["humidity_high"] > ALERT_COOLDOWN:
+            speak_alert_cached(ALERT_WAV_HUMID_HIGH, ALERT_TEXT_HUMID_HIGH)
+            alert_times["humidity_high"] = now
 
 # ============================================================
 # DISPLAY — MAIN SCREEN ZONES
