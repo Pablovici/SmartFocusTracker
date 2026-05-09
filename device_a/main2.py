@@ -1,8 +1,7 @@
-# device_a/main.py
-# Main device — weather display, sensors, voice assistant, session status.
-# Sensors: SHT30 (temp/humidity), SGP30 (CO2/TVOC), PIR (motion)
+# device_a/main2.py — version optimisee (2 appels SSL au lieu de 3)
+# STT seul (prouve) + LLM+TTS combine via /voice/respond
+# Enregistrement 3s au lieu de 5s
 # MicroPython — deployed via UIFlow 1.0
-# Assigned to: Amir
 
 import gc
 import os
@@ -32,7 +31,7 @@ HUMIDITY_MIN     = 40
 WEATHER_INTERVAL = 1800
 ALERT_COOLDOWN   = 3600
 BREAK_INTERVAL   = 2700   # 45 minutes
-RECORD_SECS      = 5
+RECORD_SECS      = 3
 VOICE_FILE       = '/flash/voice.wav'
 RESP_FILE        = '/flash/res/resp.wav'
 ALERT_WAV_BREAK  = '/flash/res/alert_break.wav'
@@ -578,6 +577,63 @@ def _ssl_post_to_wav_file(path, payload_dict, out_file):
             except: pass
 
 # ============================================================
+# HTTPS SOCKET — LLM + TTS combine (main2 uniquement)
+#
+# Envoie {question, context} en JSON, recoit le WAV de reponse.
+# Body = petit JSON texte → body_len exact, aucun risque de mismatch.
+# Remplace les appels /llm + /speak-wav en une seule connexion SSL.
+# ============================================================
+
+def _ssl_post_text_to_wav(question, context, out_file):
+    """Retourne (ok, answer, msg)."""
+    body = ujson.dumps({"question": question, "context": context}).encode('utf-8')
+    req  = ('POST /voice/respond HTTP/1.1\r\nHost: ' + CLOUD_HOST +
+            '\r\nContent-Type: application/json\r\nContent-Length: ' +
+            str(len(body)) + '\r\nConnection: close\r\n\r\n').encode('utf-8') + body
+    s = ss = f = None
+    try:
+        addr = usocket.getaddrinfo(CLOUD_HOST, CLOUD_PORT, 0, usocket.SOCK_STREAM)[0][-1]
+        s = usocket.socket(usocket.AF_INET, usocket.SOCK_STREAM)
+        s.settimeout(60); s.connect(addr)
+        ss = ussl.wrap_socket(s, server_hostname=CLOUD_HOST)
+        ss.write(req)
+        hdata = b''
+        while b'\r\n\r\n' not in hdata:
+            chunk = ss.read(256)
+            if not chunk: break
+            hdata += chunk
+        if b'\r\n\r\n' not in hdata: return False, '', 'bad response'
+        hpart, bstart = hdata.split(b'\r\n\r\n', 1)
+        code = int(hpart.split(b'\r\n')[0].decode().split(' ')[1])
+        answer = ''
+        for line in hpart.split(b'\r\n'):
+            try:
+                l = line.decode('utf-8')
+                if l.lower().startswith('x-answer:'): answer = l[9:].strip()
+            except: pass
+        if code != 200: return False, answer, 'HTTP ' + str(code)
+        safe_remove(out_file)
+        f = open(out_file, 'wb')
+        if bstart: f.write(bstart)
+        while True:
+            chunk = ss.read(512)
+            if not chunk: break
+            f.write(chunk)
+        f.close(); f = None
+        return True, answer, 'ok'
+    except Exception as e: return False, '', str(e)
+    finally:
+        if f:
+            try: f.close()
+            except: pass
+        if ss:
+            try: ss.close()
+            except: pass
+        elif s:
+            try: s.close()
+            except: pass
+
+# ============================================================
 # VOICE — HELPERS
 # ============================================================
 
@@ -725,33 +781,27 @@ def voice_flow():
 
     last_question = transcript
 
-    # 3/3 LLM
-    draw_voice_screen("Reflexion...", transcript[:44],
+    # 2/2 LLM + TTS en un seul appel SSL via /voice/respond
+    draw_voice_screen("Reflexion + Synthese...", transcript[:44],
                       status_col=COLOR_ACCENT)
-    answer = _llm_ask(transcript)
+    ok, answer, msg = _ssl_post_text_to_wav(transcript,
+                                            _build_sensor_context(),
+                                            RESP_FILE)
     gc.collect()
 
-    if not answer:
-        draw_voice_screen("IA indisponible", "",
-                          question=transcript, status_col=COLOR_WARN)
+    if not ok:
+        draw_voice_screen("Erreur", msg[:44],
+                          question=transcript, status_col=COLOR_BAD)
         time.sleep(3); return
 
     last_answer = answer
-
-    # TTS — synthese + lecture
-    draw_voice_screen("Synthese...", answer[:44], status_col=COLOR_ACCENT)
-    ok, msg = _ssl_post_to_wav_file('/speak-wav', {'text': answer}, RESP_FILE)
-    gc.collect()
 
     draw_voice_screen("Reponse !",
                       "Appuie PARLER pour rejouer",
                       question=transcript, answer=answer,
                       status_col=COLOR_GOOD)
-    if ok:
-        try: speaker.playWAV('res/resp.wav', volume=8)
-        except Exception as e: print("[SPEAKER]", e)
-    else:
-        draw_voice_screen("TTS KO", msg[:44], status_col=COLOR_BAD)
+    try: speaker.playWAV('res/resp.wav', volume=8)
+    except Exception as e: print("[SPEAKER]", e)
     gc.collect()
 
 # ============================================================

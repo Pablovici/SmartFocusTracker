@@ -387,6 +387,47 @@ def ask():
         print("[ASK] Error:", e)
         return jsonify({"error": str(e)}), 500
 
+@app.route("/voice/respond", methods=["POST"])
+def voice_respond():
+    """
+    LLM + TTS in one call. Receives {question, context}, returns raw WAV.
+    Saves one SSL handshake vs calling /llm then /speak-wav separately.
+    X-Answer header carries the text answer (newlines stripped for HTTP safety).
+    """
+    data     = request.get_json()
+    question = data.get("question") if data else None
+    context  = data.get("context")  if data else None
+    if not question:
+        return jsonify({"error": "No question provided"}), 400
+    try:
+        answer    = answer_question(question, context=context)
+        wav_bytes = text_to_speech_wav(answer)
+        safe_a    = answer.replace('\r', '').replace('\n', ' ')[:400]
+        print("[RESPOND] Q:", question, "| A:", answer[:80])
+        return wav_bytes, 200, {
+            "Content-Type":   "audio/wav",
+            "Content-Length": str(len(wav_bytes)),
+            "X-Answer":       safe_a,
+        }
+    except Exception as e:
+        print("[RESPOND] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+# ============================================================
+# ALERT LOGGING
+# ============================================================
+
+@app.route("/alert/log", methods=["POST"])
+def alert_log():
+    # Logs a device-triggered alert to BigQuery alerts_log table.
+    data       = request.get_json()
+    alert_type = data.get("alert_type") if data else None
+    message    = data.get("message")    if data else None
+    if not alert_type or not message:
+        return jsonify({"error": "alert_type and message required"}), 400
+    success = bq.insert_alert(alert_type, message)
+    return jsonify({"status": "ok" if success else "bq_error"}), 200
+
 # ============================================================
 # DASHBOARD HISTORY ROUTES
 # ============================================================
