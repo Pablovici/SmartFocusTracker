@@ -1,7 +1,6 @@
 # device_b/main.py
 # Satellite device — RFID session management with session status display.
 # MicroPython — deployed via UIFlow 1.0
-# Assigned to: Amir
 
 import gc
 import time
@@ -9,7 +8,7 @@ import network
 import urequests
 import ujson
 import unit
-from m5stack import lcd, btnA, btnB, btnC, rgb  # rgb added for LED bar control
+from m5stack import lcd, btnA, btnB, btnC, rgb
 
 # ============================================================
 # CONFIGURATION
