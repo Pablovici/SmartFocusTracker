@@ -91,6 +91,21 @@ def health():
     # Used by Cloud Run for container health checks.
     return jsonify({"status": "ok"}), 200
 
+@app.route("/time", methods=["GET"])
+def get_server_time():
+    # Returns UTC time pre-decomposed — avoids epoch conversion on MicroPython.
+    now = datetime.now(timezone.utc)
+    return jsonify({
+        "utc_epoch": int(time.time()),
+        "year":    now.year,
+        "month":   now.month,
+        "day":     now.day,
+        "weekday": now.weekday(),   # 0=Mon … 6=Sun
+        "hour":    now.hour,
+        "minute":  now.minute,
+        "second":  now.second,
+    }), 200
+
 # ============================================================
 # SENSOR DATA
 # ============================================================
