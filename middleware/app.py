@@ -5,6 +5,7 @@
 # Assigned to: Pablo
 
 import os
+import re
 import uuid
 import json
 import time
@@ -13,7 +14,7 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
 import bigquery_client as bq
-from weather_service import get_weather
+from weather_service import get_weather, CITY as DEFAULT_CITY
 from speech_service import text_to_speech, text_to_speech_wav, speech_to_text
 from llm_service import answer_question
 
@@ -49,12 +50,53 @@ _session = {
     "pauses":       [],
 }
 
-# Weather cache — avoids hammering OpenWeatherMap on every request.
-# Both devices + Streamlit can call /weather independently;
-# without caching this could trigger rate-limiting.
-# Cache TTL matches the devices' WEATHER_INTERVAL (30 min).
-_weather_cache = {"data": None, "ts": 0}
-WEATHER_CACHE_TTL = 1800  # seconds (30 min)
+# Per-city weather cache — each city has its own TTL slot.
+# Key: lowercase city name. Avoids evicting device's default city
+# when Streamlit fetches a different city.
+# Structure: _weather_cache["lausanne"] = {"data": {...}, "ts": 1234567.89}
+_weather_cache: dict = {}
+WEATHER_CACHE_TTL = 1800  # seconds (30 min per city)
+
+# ============================================================
+# CITY EXTRACTION — for voice queries
+# ============================================================
+
+_WEATHER_KEYWORDS = [
+    "météo", "meteo", "temps", "weather", "température", "temperature",
+    "forecast", "pluie", "rain", "chaud", "froid", "soleil", "neige",
+    "snow", "nuage", "cloud", "vent", "wind", "orage", "thunder",
+    "humidité", "humidity", "brouillard", "fog", "ensoleillé", "sunny",
+]
+
+_CITY_PATTERNS = [
+    r'\bà\s+([A-ZÀ-Ÿa-zà-ÿ][a-zA-Zà-ÿ\-]+(?:\s+[A-ZÀ-Ÿ][a-zA-Zà-ÿ\-]+){0,2})',
+    r'\bde\s+([A-ZÀ-Ÿ][a-zA-Zà-ÿ\-]+(?:\s+[A-ZÀ-Ÿ][a-zA-Zà-ÿ\-]+){0,2})',
+    r'\bin\s+([A-Z][a-zA-Z\-]+(?:\s+[A-Z][a-zA-Z\-]+){0,2})',
+    r'\bfor\s+([A-Z][a-zA-Z\-]+(?:\s+[A-Z][a-zA-Z\-]+){0,2})',
+    r'\bat\s+([A-Z][a-zA-Z\-]+(?:\s+[A-Z][a-zA-Z\-]+){0,2})',
+]
+
+_CITY_STOPWORDS = {
+    "home", "here", "work", "the", "a", "an", "ma", "mon",
+    "la", "le", "les", "une", "un", "des", "ce", "cet",
+}
+
+
+def _extract_city_from_question(question: str):
+    """
+    Returns a city name extracted from a weather voice query, or None.
+    Pre-filters on weather keywords before running regex to avoid false positives.
+    """
+    q_lower = question.lower()
+    if not any(kw in q_lower for kw in _WEATHER_KEYWORDS):
+        return None
+    for pattern in _CITY_PATTERNS:
+        match = re.search(pattern, question)
+        if match:
+            city = match.group(1).strip()
+            if city.lower() not in _CITY_STOPWORDS and len(city) >= 2:
+                return city
+    return None
 
 # ============================================================
 # HELPERS
@@ -140,26 +182,34 @@ def get_latest():
 @app.route("/weather", methods=["GET"])
 def weather():
     """
-    Returns current weather + forecast.
-    Responses are cached for WEATHER_CACHE_TTL (30 min) to avoid
-    hammering OpenWeatherMap on every poll from devices and Streamlit.
-    If the external fetch fails but a cached response exists, the stale
-    cache is returned with a 200 so devices always get usable data.
+    Returns current weather + forecast for the requested city.
+
+    ?city=Paris  → fetches Paris weather (Streamlit city picker).
+    No param     → uses DEFAULT_CITY (device default, env var).
+
+    BigQuery outdoor insert only happens for DEFAULT_CITY to keep the
+    outdoor_weather table consistent with the physical sensor location.
+    Stale cache is returned on OWM failure so callers always get data.
     """
-    now = time.time()
-    if _weather_cache["data"] and now - _weather_cache["ts"] < WEATHER_CACHE_TTL:
-        return jsonify(_weather_cache["data"]), 200
+    city      = (request.args.get("city") or DEFAULT_CITY).strip()
+    cache_key = city.lower()
+    now       = time.time()
+
+    slot = _weather_cache.get(cache_key)
+    if slot and (now - slot["ts"]) < WEATHER_CACHE_TTL:
+        return jsonify(slot["data"]), 200
+
     try:
-        data = get_weather()
-        bq.insert_outdoor(data["current"])
-        _weather_cache["data"] = data
-        _weather_cache["ts"]   = now
+        data = get_weather(city)
+        if cache_key == DEFAULT_CITY.lower():
+            bq.insert_outdoor(data["current"])
+        _weather_cache[cache_key] = {"data": data, "ts": now}
         return jsonify(data), 200
     except Exception as e:
-        print("[WEATHER] Error:", e)
-        if _weather_cache["data"]:
-            print("[WEATHER] Returning stale cache")
-            return jsonify(_weather_cache["data"]), 200
+        print("[WEATHER] Error for '{}': {}".format(city, e))
+        if slot:
+            print("[WEATHER] Returning stale cache for '{}'".format(city))
+            return jsonify(slot["data"]), 200
         return jsonify({"error": str(e)}), 500
 
 # ============================================================
@@ -350,6 +400,15 @@ def speak():
 # STT + LLM
 # ============================================================
 
+def _get_llm_history():
+    # Fetches the cached BQ history summary for LLM context.
+    # Returns None silently on failure so LLM still responds with live data.
+    try:
+        return bq.get_history_for_llm()
+    except Exception as e:
+        print("[HISTORY] BQ fetch failed:", e)
+        return None
+
 @app.route("/voice/transcribe", methods=["POST"])
 def voice_transcribe():
     # STT only — receives base64 WAV, returns {"transcript": "..."}.
@@ -367,14 +426,42 @@ def voice_transcribe():
 
 @app.route("/llm", methods=["POST"])
 def llm():
-    # Text-only LLM endpoint with optional sensor context.
+    """
+    Text-only LLM endpoint with city-aware weather enrichment and BQ history.
+
+    1. Scans the question for a city name via _extract_city_from_question().
+    2. If a foreign city is detected, fetches its weather and prepends it to context.
+    3. Fetches the last 3-day BQ history summary and passes it to the LLM.
+    """
     data     = request.get_json()
     question = data.get("question") if data else None
     context  = data.get("context")  if data else None
     if not question:
         return jsonify({"error": "No question provided"}), 400
+
+    # ── City enrichment ──────────────────────────────────────
+    city_in_question = _extract_city_from_question(question)
+    if city_in_question and city_in_question.lower() != DEFAULT_CITY.lower():
+        try:
+            cur = get_weather(city_in_question).get("current", {})
+            city_summary = "Weather in {}: {}, {}C, humidity {}%, wind {} m/s.".format(
+                cur.get("city", city_in_question),
+                cur.get("condition", "N/A"),
+                round(cur.get("temperature", 0), 1),
+                cur.get("humidity", "N/A"),
+                cur.get("wind_speed", "N/A"),
+            )
+            context = "{}\n{}".format(city_summary, context or "").strip()
+            print("[LLM] City enrichment: {} → {}".format(city_in_question, city_summary))
+        except Exception as e:
+            print("[LLM] City enrichment failed for '{}': {}".format(city_in_question, e))
+            context = "Note: weather for {} unavailable.\n{}".format(
+                city_in_question, context or "").strip()
+    # ─────────────────────────────────────────────────────────
+
     try:
-        answer = answer_question(question, context=context)
+        history = _get_llm_history()
+        answer  = answer_question(question, context=context, history=history)
         print("[LLM] Q:", question, "| A:", answer)
         return jsonify({"answer": answer}), 200
     except Exception as e:
@@ -390,7 +477,8 @@ def ask():
         return jsonify({"error": "No audio provided"}), 400
     try:
         question       = speech_to_text(audio_b64)
-        answer_text    = answer_question(question)
+        history        = _get_llm_history()
+        answer_text    = answer_question(question, history=history)
         audio_response = text_to_speech(answer_text)
         print("[ASK] Q:", question, "| A:", answer_text)
         return jsonify({
@@ -415,9 +503,11 @@ def voice_respond():
     if not question:
         return jsonify({"error": "No question provided"}), 400
     try:
-        answer    = answer_question(question, context=context)
+        history   = _get_llm_history()
+        answer    = answer_question(question, context=context, history=history)
         wav_bytes = text_to_speech_wav(answer)
-        safe_a    = answer.replace('\r', '').replace('\n', ' ')[:400]
+        safe_a    = ''.join(c if ord(c) < 256 else '?' for c in
+                           answer.replace('\r', '').replace('\n', ' '))[:400]
         print("[RESPOND] Q:", question, "| A:", answer[:80])
         return wav_bytes, 200, {
             "Content-Type":   "audio/wav",

@@ -214,8 +214,9 @@ alert_times = {
     "break":        -ALERT_COOLDOWN,
     "motion_greet": -GREET_COOLDOWN,
 }
-last_motion_time  = 0
-_pir_prev         = False
+last_motion_time   = 0
+_pir_prev          = False
+_sensor_read_count = 0          # SGP30 needs ~6 reads (1 min) before trusting CO2
 current_screen    = 0
 last_answer       = ""
 last_question     = ""
@@ -511,6 +512,7 @@ def connect_to_network(idx):
 # SENSORS
 # ============================================================
 def read_sensors():
+    global _sensor_read_count
     try:
         state["temperature"] = round(env.temperature, 1)
         state["humidity"]    = round(env.humidity, 1)
@@ -522,6 +524,7 @@ def read_sensors():
     try:   state["motion"] = bool(pir.value())
     except Exception as e: print("[PIR]", e)
     state["air_quality_label"] = classify_air(state["co2_ppm"])
+    if _sensor_read_count < 6: _sensor_read_count += 1
 
 def post_indoor():
     payload = {
@@ -741,10 +744,11 @@ def _ssl_post_text_to_wav(question, context, out_file):
 # ============================================================
 def _build_sensor_context():
     s = state; parts = []
-    if s["temperature"] is not None: parts.append("Temp: {}C".format(s["temperature"]))
-    if s["humidity"]    is not None: parts.append("Humidity: {}%".format(s["humidity"]))
-    if s["co2_ppm"]     is not None: parts.append("CO2: {}ppm".format(s["co2_ppm"]))
-    if s["air_quality_label"]:        parts.append("Air: {}".format(s["air_quality_label"]))
+    if s["weather_city"]:             parts.append("City: {}".format(s["weather_city"]))
+    if s["temperature"] is not None:  parts.append("Indoor temp: {}C".format(s["temperature"]))
+    if s["humidity"]    is not None:  parts.append("Indoor humidity: {}%".format(s["humidity"]))
+    if s["co2_ppm"]     is not None:  parts.append("CO2: {}ppm".format(s["co2_ppm"]))
+    if s["air_quality_label"]:        parts.append("Air quality: {}".format(s["air_quality_label"]))
     parts.append("Outdoor: {}, {}C".format(s["weather_cond"], s["weather_temp"]))
     if s["session_active"]:
         parts.append("Session: {}min worked".format(int(s["session_work_sec"] // 60)))
@@ -830,18 +834,69 @@ def update_leds():
 # ============================================================
 def _build_greeting_text():
     parts = []
-    cond = state["weather_cond"]; temp = state["weather_temp"]
+    cond = state["weather_cond"]
+    temp = state["weather_temp"]
+    c    = cond.lower() if isinstance(cond, str) else ""
+
+    t_local = time.localtime(time.time() + NTP_UTC_OFFSET * 3600)
+    hour = t_local[3]
+
+    # Outdoor summary — always first
     parts.append("Dehors : {}, {}C.".format(cond, temp))
-    c = cond.lower()
+
+    # Precipitation → umbrella
     if "rain" in c or "drizzle" in c or "shower" in c or "thunder" in c or "storm" in c:
-        parts.append("Pensez a prendre un parapluie.")
+        parts.append("Prenez un parapluie.")
+    # Snow
+    elif "snow" in c or "sleet" in c:
+        parts.append("Il neige dehors, soyez prudent.")
+    # Cold outside
+    elif isinstance(temp, int) and temp <= 5:
+        parts.append("Tres froid, couvrez-vous bien.")
+    elif isinstance(temp, int) and temp <= 10:
+        parts.append("Il fait frais, prenez une veste.")
+    # Hot outside
+    elif isinstance(temp, int) and temp >= 30:
+        parts.append("Forte chaleur, hydratez-vous.")
+    elif isinstance(temp, int) and temp >= 25:
+        parts.append("Il fait chaud dehors.")
+
+    # Indoor air quality
     if state["air_quality_label"] == "Poor":
-        parts.append("Qualite de l air mauvaise, pensez a aerer.")
+        parts.append("Air interieur mauvais, aerez la piece.")
+    elif state["air_quality_label"] == "Moderate":
+        parts.append("Air un peu charge, aerer conseille.")
+
+    # Indoor humidity
     h = state["humidity"]
     if h is not None and h < HUMIDITY_MIN:
-        parts.append("Humidite interieure basse : {}%.".format(int(h)))
+        parts.append("Humidite basse {}%, utilisez un humidificateur.".format(int(h)))
     elif h is not None and h > HUMIDITY_MAX:
-        parts.append("Humidite elevee : {}%.".format(int(h)))
+        parts.append("Humidite elevee {}%, pensez a ventiler.".format(int(h)))
+
+    # Indoor temperature comfort
+    t_in = state["temperature"]
+    if t_in is not None and t_in < 18:
+        parts.append("Piece froide {}C, pensez a chauffer.".format(int(t_in)))
+    elif t_in is not None and t_in > 26:
+        parts.append("Piece chaude {}C.".format(int(t_in)))
+
+    # Active session running too long
+    if state["session_active"] and not state["session_paused"]:
+        worked_min = int(state["session_work_sec"] // 60)
+        if worked_min >= settings["break_interval"] // 60:
+            parts.append("{}min de travail, pensez a faire une pause.".format(worked_min))
+
+    # Time-of-day contextual message
+    if 6 <= hour < 10:
+        parts.append("Bonne matinee !")
+    elif 12 <= hour < 14:
+        parts.append("Bon appetit !")
+    elif 18 <= hour < 22:
+        parts.append("Bonne soiree !")
+    elif hour >= 22 or hour < 6:
+        parts.append("Il est tard, reposez-vous bientot.")
+
     return " ".join(parts)
 
 def _motion_greet_overlay(name, summary):
@@ -881,7 +936,7 @@ def check_alerts():
             if now - alert_times["break"] > ALERT_COOLDOWN:
                 speak_alert_cached(ALERT_WAV_BREAK, ALERT_TEXT_BREAK)
                 alert_times["break"] = now
-    if state["air_quality_label"] == "Poor":
+    if state["air_quality_label"] == "Poor" and _sensor_read_count >= 6:
         if now - alert_times["air"] > ALERT_COOLDOWN:
             speak_alert_cached(ALERT_WAV_AIR, ALERT_TEXT_AIR)
             alert_times["air"] = now
@@ -897,12 +952,11 @@ def check_alerts():
             alert_times["humidity_high"] = now
     global _pir_prev
     pir_now = state["motion"]
-    # motion greet disabled — re-enable by uncommenting the block below
-    # if pir_now and not _pir_prev:
-    #     if current_screen == 0:
-    #         if now - alert_times["motion_greet"] > GREET_COOLDOWN:
-    #             speak_motion_greet()
-    #             alert_times["motion_greet"] = now
+    if pir_now and not _pir_prev:
+        if current_screen == 0:
+            if now - alert_times["motion_greet"] > GREET_COOLDOWN:
+                speak_motion_greet()
+                alert_times["motion_greet"] = now
     _pir_prev = pir_now
 
 # ============================================================
@@ -1179,16 +1233,41 @@ def draw_sensor_detail():
     t  = state["temperature"]; h = state["humidity"]
     co2= state["co2_ppm"];     tv= state["tvoc_ppb"]
     aq = state["air_quality_label"]
-    _card_base(12, 64, 296, 100)
-    lcd.font(lcd.FONT_DejaVu40)
-    lcd.print("{}{}C".format("--" if t is None else int(t), DEG), 24, 76, C_TXT1)
-    lcd.fillCircle(190, 107, 8, C_BLUE)
-    lcd.font(lcd.FONT_DejaVu24)
-    lcd.print("{}%".format("--" if h is None else int(h)), 206, 92, C_TXT2)
     acol = air_color(aq)
-    _detail_row(20, 176, "CO2",    "{} ppm".format("--" if co2 is None else co2),  acol)
-    _detail_row(20, 196, "TVOC",   "{} ppb".format("--" if tv  is None else tv),   C_L2)
-    _detail_row(20, 216, "Air",    aq,                                               acol)
+
+    # ── Top card: Temp (left) | Humidity (right) ──────────────
+    _card_base(12, 64, 296, 96)
+    lcd.fillRect(160, 70, 1, 78, C_SEP)          # vertical divider
+
+    # Temperature
+    lcd.font(lcd.FONT_Default)
+    lcd.print("TEMP", _cx("TEMP", 6, 12, 148), 70, C_TXT3)
+    t_str = "{}{}C".format("--" if t is None else int(t), DEG)
+    lcd.font(lcd.FONT_DejaVu40)
+    lcd.print(t_str, _cx(t_str, 24, 12, 148), 82, C_TXT1)
+    if t is not None:
+        lcd.font(lcd.FONT_Default)
+        exact = "{:.1f}C".format(t)
+        lcd.print(exact, _cx(exact, 6, 12, 148), 130, C_TXT3)
+
+    # Humidity
+    lcd.font(lcd.FONT_Default)
+    lcd.print("HUMIDITY", _cx("HUMIDITY", 6, 160, 148), 70, C_TXT3)
+    hcol  = C_AMBER_L if h is not None and (h < 40 or h > 60) else C_TXT2
+    h_str = "{}%".format("--" if h is None else int(h))
+    lcd.font(lcd.FONT_DejaVu24)
+    lcd.print(h_str, _cx(h_str, 14, 160, 148), 88, hcol)
+    if h is not None:
+        bx = 168; bw = 114; by = 128
+        lcd.fillRect(bx, by, bw, 4, C_SEP)
+        lcd.fillRect(bx, by, int(min(max(h, 0), 100) * bw // 100), 4, hcol)
+        lcd.fillRect(bx + 40 * bw // 100, by - 2, 1, 8, C_TXT3)   # 40% marker
+        lcd.fillRect(bx + 60 * bw // 100, by - 2, 1, 8, C_TXT3)   # 60% marker
+
+    # ── Detail rows: CO2 / TVOC / Air ─────────────────────────
+    _detail_row(20, 172, "CO2",  "{} ppm".format("--" if co2 is None else co2), acol)
+    _detail_row(20, 192, "TVOC", "{} ppb".format("--" if tv  is None else tv),  C_L2)
+    _detail_row(20, 212, "Air",  aq,                                              acol)
 
 def draw_session_detail():
     _detail_top("Home", "Session", C_GREEN_L)
@@ -1381,7 +1460,7 @@ def voice_flow():
         time.sleep(3); return
 
     last_answer = answer
-    draw_voice_screen("Reponse !", "Appuie [A] pour revenir",
+    draw_voice_screen("Reponse !", "[A] Retour   [B] Reposer",
                       question=transcript, answer=answer, status_col=C_GREEN_L)
     try: speaker.playWAV('res/resp.wav', volume=8)
     except Exception as e: print("[SPEAKER]", e)
@@ -1506,9 +1585,12 @@ def handle_buttons():
             current_screen = 0; draw_home(); _main_needs_full_redraw = False
 
     elif current_screen == 2:
-        if btnA.wasPressed() or btnB.wasPressed() or btnC.wasPressed():
+        if btnA.wasPressed() or btnC.wasPressed():
             _touch_start = None; _touch_done = False
             current_screen = 0; draw_home(); _main_needs_full_redraw = False
+        elif btnB.wasPressed():
+            _touch_start = None; _touch_done = False
+            voice_flow()
 
     else:  # screen 0 — home
         if btnA.wasPressed():

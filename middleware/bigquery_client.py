@@ -4,8 +4,11 @@
 
 import os
 import json
+import time
 from datetime import datetime, timezone
 from google.cloud import bigquery
+
+
 
 # ============================================================
 # CLIENT INITIALIZATION
@@ -25,6 +28,9 @@ TABLE_INDOOR   = "{}.{}.{}".format(PROJECT, DATASET, os.environ["BQ_TABLE_INDOOR
 TABLE_OUTDOOR  = "{}.{}.{}".format(PROJECT, DATASET, os.environ["BQ_TABLE_OUTDOOR"])
 TABLE_SESSIONS = "{}.{}.{}".format(PROJECT, DATASET, os.environ["BQ_TABLE_SESSIONS"])
 TABLE_ALERTS   = "{}.{}.{}".format(PROJECT, DATASET, os.environ["BQ_TABLE_ALERTS"])
+
+# Physical sensor city — used to filter outdoor BQ history to one location.
+DEFAULT_CITY = os.environ.get("OPENWEATHER_CITY", "Lausanne")
 
 # ============================================================
 # HELPERS
@@ -121,14 +127,20 @@ def insert_outdoor(data):
         print("[BQ] insert_outdoor errors:", errors)
     return len(errors) == 0
 
-def get_outdoor_history(days=7):
-    # Returns outdoor weather history for the last N days.
+def get_outdoor_history(days=7, city=None):
+    """
+    Returns outdoor weather history for the last N days.
+    Filters by city (case-insensitive) so charts always reflect one location.
+    Defaults to DEFAULT_CITY (physical sensor location).
+    """
+    filter_city = (city or DEFAULT_CITY).strip()
     sql = """
         SELECT timestamp, temperature, humidity, condition, wind_speed
-        FROM `{}`
-        WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {} DAY)
+        FROM `{table}`
+        WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+          AND LOWER(city) = LOWER('{city}')
         ORDER BY timestamp ASC
-    """.format(TABLE_OUTDOOR, days)
+    """.format(table=TABLE_OUTDOOR, days=days, city=filter_city)
     return run_query(sql)
 
 # ============================================================
@@ -256,3 +268,76 @@ def get_recent_alerts(limit=10):
         LIMIT {}
     """.format(TABLE_ALERTS, limit)
     return run_query(sql)
+
+# ============================================================
+# LLM HISTORY CONTEXT
+# ============================================================
+
+_llm_history_cache = {"data": None, "ts": 0.0}
+_LLM_HISTORY_TTL   = 300  # seconds (5 min) — LLM calls are infrequent
+
+def get_history_for_llm():
+    """
+    Returns a compact text summary of the last 3 days of indoor data,
+    grouped by calendar day (UTC). Cached for 5 minutes so that a burst
+    of voice questions does not hammer BigQuery.
+
+    Format (one line per day, most recent first):
+      2026-05-20: temp avg 21.5C (min 19.2 / max 24.1), humidity avg 48% max 55%,
+                  CO2 avg 820ppm max 1100ppm, air quality poor at some point.
+    """
+    now = time.time()
+    if _llm_history_cache["data"] and now - _llm_history_cache["ts"] < _LLM_HISTORY_TTL:
+        return _llm_history_cache["data"]
+
+    sql = """
+        SELECT
+            DATE(timestamp)                     AS day,
+            ROUND(AVG(temperature), 1)          AS avg_temp,
+            ROUND(MIN(temperature), 1)          AS min_temp,
+            ROUND(MAX(temperature), 1)          AS max_temp,
+            ROUND(AVG(humidity), 1)             AS avg_hum,
+            ROUND(MAX(humidity), 1)             AS max_hum,
+            ROUND(AVG(co2_ppm))                 AS avg_co2,
+            ROUND(MAX(co2_ppm))                 AS max_co2,
+            COUNTIF(air_quality_label = 'Poor') AS poor_air_count,
+            COUNTIF(humidity < 40)              AS low_hum_count,
+            COUNTIF(humidity > 60)              AS high_hum_count
+        FROM `{}`
+        WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 3 DAY)
+          AND temperature IS NOT NULL
+        GROUP BY day
+        ORDER BY day DESC
+        LIMIT 3
+    """.format(TABLE_INDOOR)
+
+    rows = run_query(sql)
+    if not rows:
+        return "No historical indoor data available."
+
+    lines = []
+    for r in rows:
+        notes = []
+        if r.get("poor_air_count"):
+            notes.append("air quality was poor at some point")
+        if r.get("low_hum_count"):
+            notes.append("humidity dropped below 40%")
+        if r.get("high_hum_count"):
+            notes.append("humidity exceeded 60%")
+        note_str = " (" + ", ".join(notes) + ")" if notes else ""
+        lines.append(
+            "{}: indoor temp avg {}C (min {} / max {}), "
+            "humidity avg {}% max {}%, "
+            "CO2 avg {}ppm max {}ppm{}".format(
+                r["day"],
+                r["avg_temp"], r["min_temp"], r["max_temp"],
+                r["avg_hum"],  r["max_hum"],
+                int(r["avg_co2"] or 0), int(r["max_co2"] or 0),
+                note_str,
+            )
+        )
+
+    result = "\n".join(lines)
+    _llm_history_cache["data"] = result
+    _llm_history_cache["ts"]   = now
+    return result
